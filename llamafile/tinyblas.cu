@@ -49,6 +49,7 @@
 #else
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#define cudaError_t hipError_t
 #define cudaSuccess hipSuccess
 #define cudaStream_t hipStream_t
 #define cudaGetLastError hipGetLastError
@@ -468,6 +469,44 @@ tinyblasStatus_t tinyblasSgemm(tinyblasHandle_t handle, tinyblasOperation_t tran
     return tinyblasGemmEx(handle, transa, transb, m, n, k, alpha, A, TINYBLAS_R_32F, lda, B,
                           TINYBLAS_R_32F, ldb, beta, C, TINYBLAS_R_32F, ldc, TINYBLAS_COMPUTE_32F,
                           TINYBLAS_GEMM_DEFAULT);
+}
+
+// Strided-batched SGEMM. There is no dedicated batched kernel: each batch is
+// an independent SGEMM at a fixed pointer stride, so launch batchCount of them
+// in sequence (serialized on the handle's stream). OUT_PROD is the only caller
+// (ggml-cuda/out-prod.cu) and is off the typical inference hot path, so the
+// per-matrix launch overhead is acceptable.
+tinyblasStatus_t tinyblasSgemmStridedBatched(tinyblasHandle_t handle, tinyblasOperation_t transa,
+                                             tinyblasOperation_t transb, int m, int n, int k,
+                                             const float *alpha, const float *A, int lda,
+                                             long long strideA, const float *B, int ldb,
+                                             long long strideB, const float *beta, float *C,
+                                             int ldc, long long strideC, int batchCount) {
+    for (int i = 0; i < batchCount; ++i) {
+        tinyblasStatus_t status =
+            tinyblasSgemm(handle, transa, transb, m, n, k, alpha, A + i * strideA, lda,
+                          B + i * strideB, ldb, beta, C + i * strideC, ldc);
+        if (status != TINYBLAS_STATUS_SUCCESS)
+            return status;
+    }
+    return TINYBLAS_STATUS_SUCCESS;
+}
+
+// Pointer-array batched SGEMM. Unlike the strided variant, cublasSgemmBatched
+// takes device-resident arrays of per-matrix pointers, so it cannot loop on the
+// host; delegate to the typed batched-Ex path, which reads the pointer arrays
+// on-device. F32 in/out with F32 compute. New caller: the out_prod broadcast
+// path in ggml-cuda/out-prod.cu (upstream #24426).
+tinyblasStatus_t tinyblasSgemmBatched(tinyblasHandle_t handle, tinyblasOperation_t transa,
+                                      tinyblasOperation_t transb, int m, int n, int k,
+                                      const float *alpha, const float *const Aarray[], int lda,
+                                      const float *const Barray[], int ldb, const float *beta,
+                                      float *const Carray[], int ldc, int batchCount) {
+    return tinyblasGemmBatchedEx(handle, transa, transb, m, n, k, alpha,
+                                 (const void *const *)Aarray, TINYBLAS_R_32F, lda,
+                                 (const void *const *)Barray, TINYBLAS_R_32F, ldb, beta,
+                                 (void *const *)Carray, TINYBLAS_R_32F, ldc, batchCount,
+                                 TINYBLAS_COMPUTE_32F, TINYBLAS_GEMM_DEFAULT);
 }
 
 template <int CONFIG, int BM, int BN, int BK, int VE, int WM, int WN, int WNI, int TM, int TN,
@@ -978,4 +1017,66 @@ tinyblasStatus_t tinyblasGemmStridedBatchedEx(tinyblasHandle_t handle, //
     default:
         return TINYBLAS_STATUS_INVALID_VALUE;
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// TRSM: Triangular Solve (Batched)
+//
+// Solves X * A = alpha * B where A is upper triangular, writing result into B.
+// One thread block per batch element. Threads parallelize over m rows.
+
+static __global__ void tinyblasStrsmBatched_kernel(int m, int n, float alpha,
+                                                    const float *const *Aarray, int lda,
+                                                    float *const *Barray, int ldb) {
+    const int batch = blockIdx.x;
+    const float *A = Aarray[batch];
+    float *B = Barray[batch];
+
+    // Solve X * A = alpha * B for right-side upper triangular (non-unit diagonal).
+    // Process columns left-to-right. For column j:
+    //   B[i][j] = (alpha * B[i][j] - sum_{p<j} B[i][p] * A[p][j]) / A[j][j]
+    for (int j = 0; j < n; j++) {
+        // Column-major: A[p][j] = A[p + j*lda], B[i][j] = B[i + j*ldb]
+        float diag = A[j + j * lda];
+        __syncthreads();
+        for (int i = threadIdx.x; i < m; i += blockDim.x) {
+            float val = alpha * B[i + j * ldb];
+            for (int p = 0; p < j; p++) {
+                val -= B[i + p * ldb] * A[p + j * lda];
+            }
+            B[i + j * ldb] = val / diag;
+        }
+    }
+}
+
+static tinyblasStatus_t tinyblasStrsmBatched_launch(tinyblasHandle_t handle, int m, int n,
+                                                     float alpha, const float *const *Aarray,
+                                                     int lda, float *const *Barray, int ldb,
+                                                     int batchCount) {
+    int threads = std::min(1024, ((m + 31) / 32) * 32);
+    if (threads < 1)
+        threads = 1;
+    tinyblasStrsmBatched_kernel<<<batchCount, threads, 0, handle->stream>>>(m, n, alpha, Aarray,
+                                                                             lda, Barray, ldb);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        return TINYBLAS_STATUS_EXECUTION_FAILED;
+    return TINYBLAS_STATUS_SUCCESS;
+}
+
+tinyblasStatus_t tinyblasStrsmBatched(tinyblasHandle_t handle, tinyblasSideMode_t side,
+                                       tinyblasFillMode_t uplo, tinyblasOperation_t trans,
+                                       tinyblasDiagType_t diag, int m, int n, const float *alpha,
+                                       const float *const Aarray[], int lda, float *const Barray[],
+                                       int ldb, int batchCount) {
+    if (side != TINYBLAS_SIDE_RIGHT || uplo != TINYBLAS_FILL_MODE_UPPER ||
+        trans != TINYBLAS_OP_N || diag != TINYBLAS_DIAG_NON_UNIT)
+        return TINYBLAS_STATUS_NOT_SUPPORTED;
+    if (!handle || !alpha || !Aarray || !Barray)
+        return TINYBLAS_STATUS_INVALID_VALUE;
+    if (m < 0 || n < 0 || lda < n || ldb < m)
+        return TINYBLAS_STATUS_INVALID_VALUE;
+    if (batchCount == 0)
+        return TINYBLAS_STATUS_SUCCESS;
+    return tinyblasStrsmBatched_launch(handle, m, n, *alpha, Aarray, lda, Barray, ldb, batchCount);
 }

@@ -1,0 +1,75 @@
+diff --git a/common/log.cpp b/common/log.cpp
+--- a/llama.cpp/common/log.cpp
++++ b/llama.cpp/common/log.cpp
+@@ -25,6 +25,7 @@
+ #    define fileno _fileno
+ #else
+ #    include <unistd.h>
++#    include <csignal>
+ #endif // defined(_WIN32)
+ 
+ int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
+@@ -243,7 +244,13 @@ public:
+         std::unique_lock<std::mutex> lock(mtx);
+ 
+         // block if the queue is full
+-        cv_full.wait(lock, [this]() { return !running || !is_full(); });
++        // Use wait_for() instead of an untimed wait to work around a
++        // Cosmopolitan libc bug where untimed futex waits on XNU (macOS)
++        // expire after ~72 minutes, causing condition_variable::wait() to
++        // throw ETIMEDOUT.
++        while (running && is_full()) {
++            cv_full.wait_for(lock, std::chrono::seconds(30));
++        }
+ 
+         if (!running) {
+             // discard messages while the worker thread is paused
+@@ -310,7 +317,13 @@ public:
+         std::unique_lock<std::mutex> lock(mtx);
+ 
+         // block if the queue is full
+-        cv_full.wait(lock, [this]() { return !running || !is_full(); });
++        // Use wait_for() instead of an untimed wait to work around a
++        // Cosmopolitan libc bug where untimed futex waits on XNU (macOS)
++        // expire after ~72 minutes, causing condition_variable::wait() to
++        // throw ETIMEDOUT.
++        while (running && is_full()) {
++            cv_full.wait_for(lock, std::chrono::seconds(30));
++        }
+ 
+         if (!running) {
+             // discard messages while the worker thread is paused
+@@ -345,9 +358,32 @@ public:
+         running = true;
+ 
+         thrd = std::thread([this]() {
++#if !defined(_WIN32)
++            // Block every signal on this thread so the condition-variable wait
++            // can't be interrupted with EINTR (libcxx rethrows EINTR as
++            // std::system_error which would std::terminate the process).
++            // Keep synchronous fault signals deliverable so real crashes
++            // still surface on whichever thread caused them.
++            sigset_t block_mask;
++            sigfillset(&block_mask);
++            sigdelset(&block_mask, SIGSEGV);
++            sigdelset(&block_mask, SIGBUS);
++            sigdelset(&block_mask, SIGILL);
++            sigdelset(&block_mask, SIGFPE);
++            sigdelset(&block_mask, SIGABRT);
++            sigdelset(&block_mask, SIGSYS);
++            sigdelset(&block_mask, SIGTRAP);
++            pthread_sigmask(SIG_BLOCK, &block_mask, nullptr);
++#endif
+             while (true) {
+                 std::unique_lock<std::mutex> lock(mtx);
+-                cv_new.wait(lock, [this]() { return !is_empty(); });
++                // Use wait_for() instead of an untimed wait to work around a
++                // Cosmopolitan libc bug where untimed futex waits on XNU
++                // (macOS) expire after ~72 minutes, causing
++                // condition_variable::wait() to throw ETIMEDOUT.
++                while (is_empty()) {
++                    cv_new.wait_for(lock, std::chrono::seconds(30));
++                }
+ 
+                 size_t cached_head = head;
+                 size_t cached_tail = tail;

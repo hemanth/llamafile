@@ -1,0 +1,420 @@
+#!/bin/bash
+#
+# Vulkan build script for llamafile (parallel compilation)
+#
+# This script compiles the GGML Vulkan backend into a shared library.
+# Unlike CUDA/ROCm, Vulkan uses standard C++ compilers (g++/clang++),
+# not vendor-specific compilers.
+#
+# Build process:
+#   1. Build vulkan-shaders-gen tool (C++17)
+#   2. Generate shader C++ files from GLSL compute shaders using glslc
+#   3. Compile the ggml-vulkan backend sources with generated shaders
+#   4. Compile core GGML sources
+#   5. Link into ggml-vulkan.so
+#
+# Requirements:
+#   - Vulkan SDK with glslc compiler
+#   - C++17 compatible compiler (g++ or clang++)
+#   - libvulkan development files
+#
+# Usage:
+#   ./vulkan.sh              # Build with auto-detected parallelism
+#   ./vulkan.sh -j16         # Build with 16 parallel jobs
+#   ./vulkan.sh --clean      # Clean and rebuild
+#   ./vulkan.sh --output /path/to/output.so
+#
+# Output: ~/ggml-vulkan.so (default)
+#
+
+set -e
+
+# Source shared build functions
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/build-functions.sh"
+
+# Parse arguments (sets JOBS, CLEAN)
+parse_build_args "$@"
+
+#
+# Vulkan-specific configuration
+#
+
+# Determine library extension based on platform
+# Cosmopolitan's cosmo_dlopen expects .dylib on macOS, .so on Linux
+if [ "$(uname -s)" = "Darwin" ]; then
+    DSO_EXT="dylib"
+else
+    DSO_EXT="so"
+fi
+
+OUTPUT="${OUTPUT:-${HOME}/ggml-vulkan.${DSO_EXT}}"
+
+# Find compilers
+CXX="${CXX:-$(command -v g++ 2>/dev/null || command -v clang++ 2>/dev/null)}"
+CC="${CC:-$(command -v gcc 2>/dev/null || command -v clang 2>/dev/null)}"
+
+if [ -z "$CXX" ]; then
+    echo "Error: No C++ compiler found (g++ or clang++)"
+    exit 1
+fi
+
+# Find glslc (Vulkan shader compiler)
+GLSLC="${GLSLC:-$(command -v glslc 2>/dev/null)}"
+if [ -z "$GLSLC" ]; then
+    # Try common Vulkan SDK locations
+    if [ -n "$VULKAN_SDK" ] && [ -x "$VULKAN_SDK/bin/glslc" ]; then
+        GLSLC="$VULKAN_SDK/bin/glslc"
+    elif [ -x "/usr/bin/glslc" ]; then
+        GLSLC="/usr/bin/glslc"
+    else
+        echo "Error: glslc not found. Please install the Vulkan SDK."
+        echo "  Linux (Ubuntu/Debian): sudo apt install vulkan-sdk spirv-headers"
+        echo "  Linux (Fedora): sudo dnf install vulkan-tools shaderc spirv-headers-devel"
+        echo "  Linux (Arch): sudo pacman -S vulkan-devel shaderc spirv-headers"
+        echo "  macOS: brew install vulkan-sdk"
+        echo "  Or set VULKAN_SDK environment variable"
+        exit 1
+    fi
+fi
+
+# Find SPIR-V headers (required by ggml-vulkan.cpp since llama.cpp PR #21572).
+# Probe the same cascade as the C++ source, plus VULKAN_SDK. For each hit,
+# strip the matched relative path off to get the -I root.
+SPIRV_INCLUDE=""
+probe() {
+    local rel="$1" base
+    for base in \
+        "$VULKAN_SDK/include" \
+        /usr/include \
+        /usr/local/include
+    do
+        [ -z "$base" ] && continue
+        if [ -f "$base/$rel" ]; then
+            SPIRV_INCLUDE="-I$base"
+            return 0
+        fi
+    done
+    return 1
+}
+probe spirv/unified1/spirv.hpp || probe spirv-headers/spirv.hpp || probe spirv.hpp || true
+if [ -z "$SPIRV_INCLUDE" ]; then
+    echo "Error: SPIR-V headers not found (spirv.hpp). Required by ggml-vulkan.cpp."
+    echo "  Linux (Ubuntu/Debian): sudo apt install spirv-headers"
+    echo "  Linux (Fedora): sudo dnf install spirv-headers-devel"
+    echo "  Linux (Arch): sudo pacman -S spirv-headers"
+    echo "  Or install the LunarG Vulkan SDK and set VULKAN_SDK."
+    exit 1
+fi
+
+# Directory setup
+LLAMAFILE_DIR="$SCRIPT_DIR"
+LLAMA_CPP_DIR="$SCRIPT_DIR/../llama.cpp"
+GGML_VULKAN_DIR="$LLAMA_CPP_DIR/ggml/src/ggml-vulkan"
+SHADERS_DIR="$GGML_VULKAN_DIR/vulkan-shaders"
+
+if [ ! -d "$GGML_VULKAN_DIR" ]; then
+    echo "Error: Vulkan source directory not found: $GGML_VULKAN_DIR"
+    exit 1
+fi
+
+# Get version info (sets GGML_VERSION, GGML_COMMIT)
+get_ggml_version "$LLAMA_CPP_DIR"
+
+# Build directory
+BUILD_DIR="${HOME}/.cache/llamafile-vulkan-build"
+setup_build_dir "$BUILD_DIR" "$CLEAN"
+
+# Subdirectories
+SHADERS_BUILD_DIR="$BUILD_DIR/shaders"
+SPVDIR="$BUILD_DIR/spv"
+mkdir -p "$SHADERS_BUILD_DIR" "$SPVDIR"
+
+echo "Building ggml-vulkan.so (parallel)..."
+echo "  Version: $GGML_VERSION (commit: $GGML_COMMIT)"
+echo "  Source:  $GGML_VULKAN_DIR"
+echo "  Output:  $OUTPUT"
+echo "  Build:   $BUILD_DIR"
+echo "  Jobs:    $JOBS"
+echo "  CXX:     $CXX"
+echo "  glslc:   $GLSLC"
+# Record the shader toolchain. A distro glslc can be years behind the SDK's and
+# silently lacks shader extensions (see the feature probe below), and the
+# Vulkan headers decide which extension code paths ggml-vulkan.cpp compiles,
+# so a build log must show which ones were used.
+GLSLC_VERSION=$("$GLSLC" --version 2>/dev/null | sed -n '1p;3p' | tr '\n' ' ' | sed 's/ *$//' || true)
+VK_HEADER_FILE=$(echo '#include <vulkan/vulkan_core.h>' | $CXX -E -x c++ $SPIRV_INCLUDE - 2>/dev/null \
+    | grep -m1 -o '"[^"]*vulkan_core\.h"' | tr -d '"' || true)
+VK_HEADER_VERSION=$(grep -m1 'define VK_HEADER_VERSION ' "${VK_HEADER_FILE:-/dev/null}" 2>/dev/null | awk '{print $3}' || true)
+echo "           ${GLSLC_VERSION:-version unknown}"
+echo "  Vulkan headers: VK_HEADER_VERSION ${VK_HEADER_VERSION:-unknown} (${VK_HEADER_FILE:-not found})"
+echo ""
+
+START_TIME=$(date +%s)
+
+#
+# Probe glslc shader extension support (mirrors upstream CMake's
+# test_shader_extension_support). These defines gate which shader variants
+# vulkan-shaders-gen emits and which pipelines ggml-vulkan.cpp creates, so
+# they must reflect the actual glslc on this machine. Omitting them
+# silently drops coopmat/coopmat2/decode-vector/integer-dot/bf16 support
+# from the DLL. Keep this list in sync with upstream's
+# test_shader_extension_support() calls in ggml-vulkan/CMakeLists.txt.
+#
+GLSLC_DEFINES=""
+SHADER_FEATURES_OK=""
+SHADER_FEATURES_MISSING=""
+FEATURE_TESTS_DIR="$SHADERS_DIR/feature-tests"
+probe_glslc_extension() {
+    # $1 = feature test shader, $2 = define
+    if "$GLSLC" -o /dev/null -fshader-stage=compute --target-env=vulkan1.3 \
+            "$FEATURE_TESTS_DIR/$1" >/dev/null 2>&1; then
+        GLSLC_DEFINES="$GLSLC_DEFINES -D$2"
+        SHADER_FEATURES_OK="$SHADER_FEATURES_OK ${1%.comp}"
+        echo "  $1: supported"
+    else
+        SHADER_FEATURES_MISSING="$SHADER_FEATURES_MISSING ${1%.comp}"
+        echo "  $1: not supported by glslc"
+    fi
+}
+echo "Probing glslc shader extension support..."
+probe_glslc_extension coopmat.comp                GGML_VULKAN_COOPMAT_GLSLC_SUPPORT
+probe_glslc_extension coopmat2.comp               GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT
+probe_glslc_extension coopmat2_decode_vector.comp GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT
+probe_glslc_extension integer_dot.comp            GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+probe_glslc_extension bfloat16.comp               GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT
+probe_glslc_extension float_e2m1.comp             GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT
+probe_glslc_extension float_e4m3.comp             GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT
+echo ""
+
+# The defines bake into vulkan-shaders-gen, the generated header, and every
+# cached artifact derived from them; invalidate the cache when they change.
+FEATURES_STAMP="$BUILD_DIR/glslc-features.txt"
+if [ ! -f "$FEATURES_STAMP" ] || [ "$(cat "$FEATURES_STAMP" 2>/dev/null)" != "$GLSLC_DEFINES" ]; then
+    echo "glslc feature set changed; clearing cached shader artifacts"
+    rm -f "$BUILD_DIR/vulkan-shaders-gen" "$BUILD_DIR/ggml-vulkan-shaders.hpp"
+    rm -f "$BUILD_DIR"/ggml-vulkan*.o
+    rm -rf "$SHADERS_BUILD_DIR" "$SPVDIR"
+    mkdir -p "$SHADERS_BUILD_DIR" "$SPVDIR"
+    rm -f "$BUILD_DIR"/shader-*.o
+    printf '%s' "$GLSLC_DEFINES" > "$FEATURES_STAMP"
+fi
+
+#
+# Phase 1: Build vulkan-shaders-gen tool
+#
+echo "Phase 1: Building vulkan-shaders-gen..."
+
+SHADERS_GEN_SRC="$SHADERS_DIR/vulkan-shaders-gen.cpp"
+SHADERS_GEN_BIN="$BUILD_DIR/vulkan-shaders-gen"
+
+if [ ! -f "$SHADERS_GEN_BIN" ] || [ "$SHADERS_GEN_SRC" -nt "$SHADERS_GEN_BIN" ]; then
+    echo "  Compiling vulkan-shaders-gen.cpp..."
+    $CXX -std=c++17 -O2 $GLSLC_DEFINES -o "$SHADERS_GEN_BIN" "$SHADERS_GEN_SRC" -lpthread
+else
+    echo "  vulkan-shaders-gen is up to date"
+fi
+
+#
+# Phase 2: Generate shader header (contains declarations)
+#
+echo ""
+echo "Phase 2: Generating shader header..."
+
+SHADERS_HPP="$BUILD_DIR/ggml-vulkan-shaders.hpp"
+if [ ! -f "$SHADERS_HPP" ]; then
+    echo "  Generating ggml-vulkan-shaders.hpp..."
+    "$SHADERS_GEN_BIN" \
+        --output-dir "$SPVDIR" \
+        --target-hpp "$SHADERS_HPP"
+else
+    echo "  Shader header already exists"
+fi
+
+#
+# Phase 3: Compile shaders and generate C++ source files
+#
+echo ""
+echo "Phase 3: Compiling shaders..."
+
+# Collect shader files
+SHADER_FILES=$(find "$SHADERS_DIR" -maxdepth 1 -name "*.comp" -type f | sort)
+NUM_SHADERS=$(echo "$SHADER_FILES" | wc -l)
+echo "  Found $NUM_SHADERS shader files"
+
+count=0
+for shader in $SHADER_FILES; do
+    count=$((count + 1))
+    shader_name=$(basename "$shader")
+    shader_cpp="$SHADERS_BUILD_DIR/${shader_name}.cpp"
+
+    # Skip if cpp file is newer than shader
+    if [ -f "$shader_cpp" ] && [ "$shader_cpp" -nt "$shader" ]; then
+        echo "  [$count/$NUM_SHADERS] Skipping: $shader_name (up to date)"
+        continue
+    fi
+
+    echo "  [$count/$NUM_SHADERS] Compiling: $shader_name"
+    "$SHADERS_GEN_BIN" \
+        --glslc "$GLSLC" \
+        --source "$shader" \
+        --output-dir "$SPVDIR" \
+        --target-hpp "$SHADERS_HPP" \
+        --target-cpp "$shader_cpp" &
+
+    # Limit parallel jobs
+    running=$(jobs -r | wc -l)
+    while [ "$running" -ge "$JOBS" ]; do
+        sleep 0.1
+        running=$(jobs -r | wc -l)
+    done
+done
+
+echo ""
+echo "Waiting for shader compilation to finish..."
+wait
+
+SHADER_TIME=$(date +%s)
+echo "Shader compilation took $((SHADER_TIME - START_TIME)) seconds"
+
+#
+# Phase 4: Compile shader C++ files
+#
+echo ""
+echo "Phase 4: Compiling shader C++ files..."
+
+SHADER_CPP_FILES=$(find "$SHADERS_BUILD_DIR" -name "*.cpp" -type f)
+NUM_SHADER_CPPS=$(echo "$SHADER_CPP_FILES" | wc -l)
+echo "  Found $NUM_SHADER_CPPS shader C++ files"
+
+CXX_FLAGS="-O2 -fPIC -std=c++17 \
+    -I$LLAMA_CPP_DIR/ggml/include \
+    -I$LLAMA_CPP_DIR/ggml/src \
+    -I$BUILD_DIR \
+    -DNDEBUG \
+    -DGGML_BUILD=1 \
+    -DGGML_SHARED=1 \
+    -DGGML_MULTIPLATFORM \
+    $GLSLC_DEFINES"
+
+count=0
+for src in $SHADER_CPP_FILES; do
+    count=$((count + 1))
+    base=$(basename "$src" .cpp)
+    obj="$BUILD_DIR/shader-${base}.o"
+
+    # Skip if object file is newer than source
+    if [ -f "$obj" ] && [ "$obj" -nt "$src" ]; then
+        echo "  [$count/$NUM_SHADER_CPPS] Skipping: $base (up to date)"
+        continue
+    fi
+
+    echo "  [$count/$NUM_SHADER_CPPS] Compiling: $base"
+    $CXX -c $CXX_FLAGS -o "$obj" "$src" &
+
+    # Limit parallel jobs
+    running=$(jobs -r | wc -l)
+    while [ "$running" -ge "$JOBS" ]; do
+        sleep 0.1
+        running=$(jobs -r | wc -l)
+    done
+done
+
+echo ""
+echo "Waiting for shader C++ compilation to finish..."
+wait
+
+#
+# Phase 5: Compile the backend sources
+#
+# Since b11100 the backend is split over several translation units
+# (ggml-vulkan.cpp plus ggml-vulkan-buffers.cpp, ggml-vulkan-debug.cpp, ...),
+# so take every .cpp at the top of ggml-vulkan/ rather than naming one. The
+# shader generator under vulkan-shaders/ is built in phase 3 and excluded by
+# -maxdepth 1.
+#
+echo ""
+echo "Phase 5: Compiling backend sources..."
+
+VULKAN_SRCS=$(find "$GGML_VULKAN_DIR" -maxdepth 1 -name "*.cpp" -type f | sort)
+if [ -z "$VULKAN_SRCS" ]; then
+    echo "Error: no backend sources found in $GGML_VULKAN_DIR"
+    exit 1
+fi
+
+for src in $VULKAN_SRCS; do
+    base=$(basename "$src" .cpp)
+    obj="$BUILD_DIR/${base}.o"
+
+    if [ -f "$obj" ] && [ "$obj" -nt "$src" ] && [ "$obj" -nt "$SHADERS_HPP" ]; then
+        echo "  Skipping: $base (up to date)"
+        continue
+    fi
+
+    echo "  Compiling: $base"
+    $CXX -c $CXX_FLAGS \
+        -I$GGML_VULKAN_DIR \
+        $SPIRV_INCLUDE \
+        -o "$obj" "$src"
+done
+
+#
+# Phase 6: Compile core GGML sources
+#
+echo ""
+echo "Phase 6: Compiling core GGML sources..."
+compile_ggml_core "$LLAMA_CPP_DIR" "$BUILD_DIR"
+
+#
+# Phase 7: Link
+#
+echo ""
+echo "Phase 7: Linking..."
+
+OBJ_FILES=$(find "$BUILD_DIR" -name "*.o" -type f | tr '\n' ' ')
+NUM_OBJS=$(find "$BUILD_DIR" -name "*.o" -type f | wc -l)
+echo "  Linking $NUM_OBJS object files..."
+
+# Platform-specific link flags
+LINK_FLAGS="-shared -fPIC"
+if [ "$(uname -s)" = "Darwin" ]; then
+    # On macOS, set rpath so libvulkan can be found at runtime
+    # Check common locations for Vulkan SDK
+    if [ -n "$VULKAN_SDK" ] && [ -d "$VULKAN_SDK/lib" ]; then
+        VULKAN_LIB_PATH="$VULKAN_SDK/lib"
+    elif [ -d "/usr/local/lib" ] && [ -f "/usr/local/lib/libvulkan.dylib" ]; then
+        VULKAN_LIB_PATH="/usr/local/lib"
+    elif [ -d "/opt/homebrew/lib" ] && [ -f "/opt/homebrew/lib/libvulkan.dylib" ]; then
+        VULKAN_LIB_PATH="/opt/homebrew/lib"
+    else
+        echo "Warning: Could not find libvulkan location for rpath"
+        VULKAN_LIB_PATH="/usr/local/lib"
+    fi
+    LINK_FLAGS="$LINK_FLAGS -Wl,-rpath,$VULKAN_LIB_PATH -L$VULKAN_LIB_PATH"
+elif [ "$(uname -s)" = "Linux" ]; then
+    # Statically link libstdc++/libgcc so the shipped .so does not depend on
+    # the build host's GLIBCXX version. See link_shared_library in
+    # build-functions.sh for the full rationale.
+    LINK_FLAGS="$LINK_FLAGS -static-libstdc++ -static-libgcc"
+fi
+
+$CXX $LINK_FLAGS -o "$OUTPUT" $OBJ_FILES -lvulkan -lpthread
+
+# Done
+END_TIME=$(date +%s)
+echo ""
+echo "Total time: $((END_TIME - START_TIME)) seconds"
+echo ""
+echo "Successfully built: $OUTPUT"
+ls -lh "$OUTPUT"
+echo ""
+echo "Toolchain:"
+echo "  glslc:           $GLSLC"
+echo "                   ${GLSLC_VERSION:-version unknown}"
+echo "  Vulkan headers:  VK_HEADER_VERSION ${VK_HEADER_VERSION:-unknown} (${VK_HEADER_FILE:-not found})"
+echo "  Shader features: ${SHADER_FEATURES_OK# }"
+if [ -n "$SHADER_FEATURES_MISSING" ]; then
+    echo "  MISSING:         ${SHADER_FEATURES_MISSING# }"
+    echo "                   (not supported by this glslc; the corresponding GPU paths are"
+    echo "                   not in the module -- build with the LunarG Vulkan SDK, VULKAN_SDK=...)"
+fi

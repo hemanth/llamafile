@@ -1,0 +1,15 @@
+[submodule "whisper.cpp"]
+	path = whisper.cpp
+	url = https://github.com/ggerganov/whisper.cpp.git
+[submodule "stable-diffusion.cpp"]
+	path = stable-diffusion.cpp
+	url = https://github.com/leejet/stable-diffusion.cpp.git
+[submodule "llama.cpp"]
+	path = llama.cpp
+	url = https://github.com/ggerganov/llama.cpp.git
+[submodule "third_party/zipalign"]
+	path = third_party/zipalign
+	url = https://github.com/jart/zipalign.git
+[submodule "transcribe.cpp"]
+	path = transcribe.cpp
+	url = https://github.com/handy-computer/transcribe.cpp.git

@@ -1,0 +1,440 @@
+@echo off
+setlocal enabledelayedexpansion
+:: Compiles distributable DLL for NVIDIA GPU support (TinyBLAS)
+:: Parallel version — uses a small C job runner for concurrent nvcc compilation
+::
+:: The artifact will only depend on KERNEL32.DLL and NVCUDA.DLL.
+:: NVCUDA DLLs are provided by the installation of the windows GPU
+:: driver on a Windows system that has a CUDA-capable GPU installed.
+::
+:: Usage:
+::   llamafile\cuda_parallel.bat              Build with TinyBLAS (default)
+::   llamafile\cuda_parallel.bat --cublas     Build with NVIDIA cuBLAS
+::   llamafile\cuda_parallel.bat --clean      Clean and rebuild
+::   llamafile\cuda_parallel.bat -j8          Use 8 parallel jobs
+::
+:: Output: ggml-cuda.dll in the repo root (default)
+
+:: -------- directories --------
+:: Capture %~dp0 BEFORE any goto (goto corrupts %~dp0 in batch)
+for %%I in ("%~dp0.") do set "LLAMAFILE_DIR=%%~fI"
+for %%I in ("%~dp0..") do set "REPO_DIR=%%~fI"
+
+:: -------- parse arguments --------
+set "USE_CUBLAS=0"
+set "CLEAN=0"
+set "OUTPUT="
+set "JOBS=%NUMBER_OF_PROCESSORS%"
+if not defined JOBS set "JOBS=4"
+set "MINIMAL_ARCHS=0"
+set "NO_IQ_QUANTS=0"
+set "STRIP=0"
+set "COMPRESS=0"
+set "FA_ALL_QUANTS=0"
+
+:parse_args
+if "%~1"=="" goto done_args
+if /i "%~1"=="--cublas"        (set "USE_CUBLAS=1"     & shift & goto parse_args)
+if /i "%~1"=="--clean"         (set "CLEAN=1"          & shift & goto parse_args)
+if /i "%~1"=="--output"        (set "OUTPUT=%~2"       & shift & shift & goto parse_args)
+if /i "%~1"=="--fa-all-quants" (set "FA_ALL_QUANTS=1"  & shift & goto parse_args)
+if /i "%~1"=="--minimize-size" (set "MINIMAL_ARCHS=1"  & set "NO_IQ_QUANTS=1" & set "STRIP=1" & set "COMPRESS=1" & shift & goto parse_args)
+if /i "%~1"=="--minimal-archs" (set "MINIMAL_ARCHS=1"  & shift & goto parse_args)
+if /i "%~1"=="--no-iq-quants"  (set "NO_IQ_QUANTS=1"   & shift & goto parse_args)
+if /i "%~1"=="--strip"         (set "STRIP=1"          & shift & goto parse_args)
+if /i "%~1"=="--compress"      (set "COMPRESS=1"       & shift & goto parse_args)
+if /i "%~1"=="--help" (
+    echo Usage: cuda_parallel.bat [-jN] [--clean] [--cublas] [--output PATH]
+    echo   -jN              Use N parallel jobs ^(default: NUMBER_OF_PROCESSORS^)
+    echo   --clean          Clean build directory before building
+    echo   --cublas         Use NVIDIA cuBLAS instead of TinyBLAS
+    echo   --output         Output path for shared library
+    echo   --fa-all-quants  Compile all flash-attention vec quant combos
+    echo                    ^(default: f16-f16, q4_0-q4_0, q8_0-q8_0, bf16-bf16 only^)
+    echo.
+    echo Size reduction options ^(all off by default^):
+    echo   --minimize-size  Enable all size reduction options below
+    echo   --minimal-archs  Use virtual PTX for sm_75/sm_90, real SASS for sm_80/86/89
+    echo   --no-iq-quants   Exclude IQ quant MMQ template instances
+    echo   --strip          No-op on Windows ^(debug info is in a separate .pdb^)
+    echo   --compress       Pass --compress-mode=size to nvcc ^(requires CUDA ^>= 12.8^)
+    exit /b 0
+)
+:: Handle -jN
+set "ARG=%~1"
+if "!ARG:~0,2!"=="-j" (
+    set "JOBS=!ARG:~2!"
+    shift
+    goto parse_args
+)
+echo Unknown option: %~1
+exit /b 1
+:done_args
+
+:: -------- find Visual Studio / Build Tools --------
+where cl >nul 2>&1
+if errorlevel 1 (
+    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+    if not exist "!VSWHERE!" (
+        echo Error: cl.exe not found in PATH and vswhere.exe not found
+        echo Please run from a Visual Studio Developer Command Prompt
+        exit /b 1
+    )
+    for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+        set "VS_PATH=%%i"
+    )
+    if not defined VS_PATH (
+        echo Error: Visual Studio with C++ tools not found
+        exit /b 1
+    )
+    call "!VS_PATH!\VC\Auxiliary\Build\vcvarsall.bat" x64
+)
+
+set "LLAMA_CPP_DIR=%REPO_DIR%\llama.cpp"
+set "GGML_CUDA_DIR=%LLAMA_CPP_DIR%\ggml\src\ggml-cuda"
+set "GGML_SRC_DIR=%LLAMA_CPP_DIR%\ggml\src"
+set "GGML_INC_DIR=%LLAMA_CPP_DIR%\ggml\include"
+
+if not exist "%GGML_CUDA_DIR%" (
+    echo Error: CUDA source directory not found: %GGML_CUDA_DIR%
+    exit /b 1
+)
+
+:: -------- BLAS configuration --------
+if "%USE_CUBLAS%"=="1" (
+    set "BUILD_DIR=%USERPROFILE%\.cache\llamafile-cuda-cublas-build"
+    set "BLAS_NAME=cuBLAS"
+    set "BLAS_DEFINE=-DGGML_USE_CUBLAS"
+    set "LINK_LIBS=-lcuda -lcublas"
+) else (
+    set "BUILD_DIR=%USERPROFILE%\.cache\llamafile-cuda-build"
+    set "BLAS_NAME=TinyBLAS"
+    set "BLAS_DEFINE=-DGGML_USE_TINYBLAS"
+    set "LINK_LIBS=-lcuda"
+)
+
+if "%OUTPUT%"=="" set "OUTPUT=%REPO_DIR%\ggml-cuda.dll"
+
+:: -------- clean --------
+if "%CLEAN%"=="1" (
+    if exist "%BUILD_DIR%" (
+        echo Cleaning build directory...
+        rmdir /s /q "%BUILD_DIR%"
+    )
+)
+if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
+
+:: -------- check nvcc --------
+where nvcc >nul 2>&1
+if errorlevel 1 (
+    echo Error: nvcc not found in PATH
+    echo Please install CUDA toolkit and ensure nvcc is in your PATH
+    exit /b 1
+)
+
+:: -------- build parallel job runner --------
+set "PARALLEL=%BUILD_DIR%\parallel.exe"
+if not exist "%PARALLEL%" (
+    echo Building parallel job runner...
+    cl /nologo /O2 /Fe:"%PARALLEL%" "%LLAMAFILE_DIR%\parallel.c"
+    if errorlevel 1 (echo Error: failed to build parallel.exe & exit /b 1)
+    :: Clean up .obj left by cl in current directory
+    del /q parallel.obj 2>nul
+    echo.
+)
+
+:: -------- architecture flags --------
+:: Virtual PTX for less-used archs (JIT on first run), real SASS for popular archs.
+set "ARCH_FLAGS="
+if "%MINIMAL_ARCHS%"=="1" (
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_75,code=compute_75"
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_80,code=sm_80"
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_86,code=sm_86"
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_89,code=sm_89"
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_90,code=compute_90"
+) else (
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_75,code=sm_75"
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_80,code=sm_80"
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_86,code=sm_86"
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_89,code=sm_89"
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_90,code=sm_90"
+)
+
+:: Detect CUDA version for Blackwell and compress support.
+:: nvcc emits e.g. "Cuda compilation tools, release 13.2, V13.2.51".
+:: Parse in flat single-char-delim steps. A previous attempt that used
+:: `delims=, .` (comma+space+dot together, with `.` right before the
+:: closing quote) errors with `." was unexpected at this time.` on the
+:: cmd.exe shipped with at least some Windows builds, so the loop never
+:: runs and the version falls back to 0. `/b /c:` anchors findstr to the
+:: literal version line — without /c:, the space in the pattern would
+:: split it into two OR'd regex patterns.
+set "CUDA_MAJOR=0"
+set "CUDA_MINOR=0"
+set "_REL_LINE="
+set "_REL_VER="
+for /f "tokens=2 delims=," %%a in ('nvcc --version 2^>nul ^| findstr /b /c:"Cuda compilation tools"') do set "_REL_LINE=%%a"
+for /f "tokens=2" %%a in ("!_REL_LINE!") do set "_REL_VER=%%a"
+for /f "tokens=1,2 delims=." %%a in ("!_REL_VER!") do (
+    set "CUDA_MAJOR=%%a"
+    set "CUDA_MINOR=%%b"
+)
+if "%CUDA_MAJOR%"=="13" (
+    set "ARCH_FLAGS=!ARCH_FLAGS! -gencode arch=compute_120f,code=sm_120f"
+)
+
+:: --compress-mode=size: opt-in via --compress (or --minimize-size). Requires CUDA >= 12.8.
+if "%COMPRESS%"=="1" (
+    set "COMPRESS_OK=0"
+    if !CUDA_MAJOR! gtr 12 set "COMPRESS_OK=1"
+    if !CUDA_MAJOR! equ 12 if !CUDA_MINOR! geq 8 set "COMPRESS_OK=1"
+    if "!COMPRESS_OK!"=="1" (
+        set "ARCH_FLAGS=!ARCH_FLAGS! --compress-mode=size"
+    ) else (
+        echo Warning: --compress requested but CUDA !CUDA_MAJOR!.!CUDA_MINOR! ^< 12.8; ignoring.
+    )
+)
+
+:: -------- copy TinyBLAS files if needed --------
+if "%USE_CUBLAS%"=="0" (
+    copy /y "%LLAMAFILE_DIR%\tinyblas.h"       "%BUILD_DIR%\" >nul
+    copy /y "%LLAMAFILE_DIR%\tinyblas.cu"      "%BUILD_DIR%\" >nul
+    copy /y "%LLAMAFILE_DIR%\tinyblas-compat.h" "%BUILD_DIR%\" >nul
+)
+
+:: -------- common NVCC flags --------
+set "COMMON_FLAGS=--threads 5 --use_fast_math --extended-lambda"
+if "%USE_CUBLAS%"=="0" set "COMMON_FLAGS=%COMMON_FLAGS% -I%BUILD_DIR%"
+set "COMMON_FLAGS=%COMMON_FLAGS% -I%GGML_INC_DIR% -I%GGML_SRC_DIR% -I%GGML_CUDA_DIR%"
+set "COMMON_FLAGS=%COMMON_FLAGS% --forward-unknown-to-host-compiler"
+set "COMMON_FLAGS=%COMMON_FLAGS% --std=c++17"
+set "COMMON_FLAGS=%COMMON_FLAGS% -Xcompiler="/nologo /EHsc /O2 /GR /MT /std:c++17 /Zc:preprocessor""
+set "COMMON_FLAGS=%COMMON_FLAGS% -diag-suppress 177 -diag-suppress 221 -diag-suppress 550"
+set "COMMON_FLAGS=%COMMON_FLAGS% -DNDEBUG -DGGML_BUILD=1 -DGGML_SHARED=1 -DGGML_BACKEND_SHARED=1 -DGGML_BACKEND_BUILD=1 -DGGML_MULTIPLATFORM"
+set "COMMON_FLAGS=%COMMON_FLAGS% -DGGML_CUDA_USE_GRAPHS"
+set "COMMON_FLAGS=%COMMON_FLAGS% %BLAS_DEFINE%"
+if "%NO_IQ_QUANTS%"=="1"  set "COMMON_FLAGS=%COMMON_FLAGS% -DGGML_CUDA_NO_IQ_QUANTS"
+
+:: fattn.cu gates every K-V combination on a GGML_CUDA_FA_<K>_<V> macro that
+:: must be defined to 0 or 1 for all of them (since b11100; upstream emits them
+:: from ggml_cuda_fattn_vec_instances() in ggml/cmake/common.cmake). Selecting
+:: template-instance files is no longer enough -- an undefined macro is a hard
+:: error in the if constexpr. Keep this list and the default combinations in
+:: sync with FA_TYPES / FA_DEFAULT_COMBINATIONS in llamafile/build-functions.sh.
+:: (The informational GGML_CUDA_FA_QUANTS string macro is #ifdef-guarded and is
+:: not set here, to avoid quoting it through cmd.)
+set "FA_TYPES=Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 BF16 F16"
+if "%FA_ALL_QUANTS%"=="1" (
+    set "FA_COMBINATIONS="
+    for %%v in (%FA_TYPES%) do for %%k in (%FA_TYPES%) do call set "FA_COMBINATIONS=%%FA_COMBINATIONS%% %%k-%%v"
+) else (
+    set "FA_COMBINATIONS=Q4_0-Q4_0 Q8_0-Q8_0 F16-F16 BF16-BF16"
+)
+for %%v in (%FA_TYPES%) do for %%k in (%FA_TYPES%) do (
+    set "FA_COMPILED=0"
+    for %%c in (!FA_COMBINATIONS!) do if /i "%%c"=="%%k-%%v" set "FA_COMPILED=1"
+    set "COMMON_FLAGS=!COMMON_FLAGS! -DGGML_CUDA_FA_%%k_%%v=!FA_COMPILED!"
+)
+
+:: -------- extract GGML version --------
+set "GGML_VERSION=unknown"
+set "GGML_COMMIT=unknown"
+set "CMAKE_FILE=%LLAMA_CPP_DIR%\ggml\CMakeLists.txt"
+if exist "%CMAKE_FILE%" (
+    for /f "tokens=2 delims=()" %%a in ('findstr /c:"set(GGML_VERSION_MAJOR" "%CMAKE_FILE%"') do (
+        for /f "tokens=2" %%v in ("%%a") do set "GGML_VER_MAJOR=%%v"
+    )
+    for /f "tokens=2 delims=()" %%a in ('findstr /c:"set(GGML_VERSION_MINOR" "%CMAKE_FILE%"') do (
+        for /f "tokens=2" %%v in ("%%a") do set "GGML_VER_MINOR=%%v"
+    )
+    for /f "tokens=2 delims=()" %%a in ('findstr /c:"set(GGML_VERSION_PATCH" "%CMAKE_FILE%"') do (
+        for /f "tokens=2" %%v in ("%%a") do set "GGML_VER_PATCH=%%v"
+    )
+    set "GGML_VERSION=!GGML_VER_MAJOR!.!GGML_VER_MINOR!.!GGML_VER_PATCH!"
+)
+pushd "%LLAMA_CPP_DIR%\ggml" 2>nul && (
+    for /f %%h in ('git rev-parse --short HEAD 2^>nul') do set "GGML_COMMIT=%%h"
+    popd
+)
+
+echo Building ggml-cuda.dll with %BLAS_NAME%...
+echo   Version: !GGML_VERSION! (commit: !GGML_COMMIT!)
+echo   Source:  %GGML_CUDA_DIR%
+echo   Output:  %OUTPUT%
+echo   Build:   %BUILD_DIR%
+echo   Jobs:    %JOBS%
+if "%MINIMAL_ARCHS%%NO_IQ_QUANTS%%STRIP%%COMPRESS%" neq "0000" (
+    echo   Size reduction:
+    if "%MINIMAL_ARCHS%"=="1" echo     - Minimal archs ^(PTX for sm_75/sm_90^)
+    if "%NO_IQ_QUANTS%"=="1"  echo     - No IQ quant templates
+    if "%STRIP%"=="1"         echo     - Strip ^(no-op on Windows; debug info is in a separate .pdb^)
+    if "%COMPRESS%"=="1"      echo     - Compress mode enabled
+)
+if "%FA_ALL_QUANTS%"=="1"     echo   FA all quants: all fattn-vec template instances included
+echo.
+
+:: -------- generate compilation command list --------
+set "CMD_FILE=%BUILD_DIR%\compile_cmds.txt"
+set "OBJ_FILES="
+
+:: Empty the command file
+type nul > "%CMD_FILE%"
+set /a CMD_COUNT=0
+
+:: TinyBLAS source
+if "%USE_CUBLAS%"=="0" (
+    set "OBJ=%BUILD_DIR%\tinyblas.obj"
+    if not exist "!OBJ!" (
+        echo tinyblas.cu:::nvcc -c %ARCH_FLAGS% %COMMON_FLAGS% -o "!OBJ!" "%BUILD_DIR%\tinyblas.cu">> "%CMD_FILE%"
+        set /a CMD_COUNT+=1
+    )
+    set "OBJ_FILES=!OBJ_FILES! "!OBJ!""
+)
+
+:: Main CUDA sources
+for %%f in ("%GGML_CUDA_DIR%\*.cu") do (
+    set "BASE=%%~nf"
+    set "OBJ=%BUILD_DIR%\!BASE!.obj"
+    if not exist "!OBJ!" (
+        echo !BASE!.cu:::nvcc -c %ARCH_FLAGS% %COMMON_FLAGS% -o "!OBJ!" "%%f">> "%CMD_FILE%"
+        set /a CMD_COUNT+=1
+    )
+    set "OBJ_FILES=!OBJ_FILES! "!OBJ!""
+)
+
+:: Template-instances: selectively included to mirror upstream CMake defaults.
+set "TI_DIR=%GGML_CUDA_DIR%\template-instances"
+
+:: 2. fattn-mma and fattn-tile instances (always included)
+for %%f in ("%TI_DIR%\fattn-mma-*.cu" "%TI_DIR%\fattn-tile-*.cu") do (
+    set "BASE=%%~nf"
+    set "OBJ=%BUILD_DIR%\ti-!BASE!.obj"
+    if not exist "!OBJ!" (
+        echo ti-!BASE!.cu:::nvcc -c %ARCH_FLAGS% %COMMON_FLAGS% -o "!OBJ!" "%%f">> "%CMD_FILE%"
+        set /a CMD_COUNT+=1
+    )
+    set "OBJ_FILES=!OBJ_FILES! "!OBJ!""
+)
+
+:: 3. fattn-vec: only the 4 default quant combos unless --fa-all-quants.
+if "%FA_ALL_QUANTS%"=="1" (
+    set "FATTN_VEC_GLOB=%TI_DIR%\fattn-vec-instance-*.cu"
+) else (
+    set "FATTN_VEC_GLOB=%TI_DIR%\fattn-vec-instance-f16-f16.cu %TI_DIR%\fattn-vec-instance-q4_0-q4_0.cu %TI_DIR%\fattn-vec-instance-q8_0-q8_0.cu %TI_DIR%\fattn-vec-instance-bf16-bf16.cu"
+)
+for %%f in (!FATTN_VEC_GLOB!) do (
+    if exist "%%f" (
+        set "BASE=%%~nf"
+        set "OBJ=%BUILD_DIR%\ti-!BASE!.obj"
+        if not exist "!OBJ!" (
+            echo ti-!BASE!.cu:::nvcc -c %ARCH_FLAGS% %COMMON_FLAGS% -o "!OBJ!" "%%f">> "%CMD_FILE%"
+            set /a CMD_COUNT+=1
+        )
+        set "OBJ_FILES=!OBJ_FILES! "!OBJ!""
+    )
+)
+
+:: 4. mmf instances (always included)
+for %%f in ("%TI_DIR%\mmf-*.cu") do (
+    set "BASE=%%~nf"
+    set "OBJ=%BUILD_DIR%\ti-!BASE!.obj"
+    if not exist "!OBJ!" (
+        echo ti-!BASE!.cu:::nvcc -c %ARCH_FLAGS% %COMMON_FLAGS% -o "!OBJ!" "%%f">> "%CMD_FILE%"
+        set /a CMD_COUNT+=1
+    )
+    set "OBJ_FILES=!OBJ_FILES! "!OBJ!""
+)
+
+:: 5. mmq instances: all unless --no-iq-quants excludes mmq-instance-iq*
+for %%f in ("%TI_DIR%\mmq-*.cu") do (
+    set "BASE=%%~nf"
+    set "SKIP=0"
+    if "%NO_IQ_QUANTS%"=="1" (
+        echo !BASE! | findstr /b /i "mmq-instance-iq" >nul
+        if not errorlevel 1 set "SKIP=1"
+    )
+    if "!SKIP!"=="0" (
+        set "OBJ=%BUILD_DIR%\ti-!BASE!.obj"
+        if not exist "!OBJ!" (
+            echo ti-!BASE!.cu:::nvcc -c %ARCH_FLAGS% %COMMON_FLAGS% -o "!OBJ!" "%%f">> "%CMD_FILE%"
+            set /a CMD_COUNT+=1
+        )
+        set "OBJ_FILES=!OBJ_FILES! "!OBJ!""
+    )
+)
+
+:: -------- compile .cu sources in parallel --------
+if !CMD_COUNT! gtr 0 (
+    echo Compiling !CMD_COUNT! .cu files with %JOBS% parallel jobs...
+    echo.
+    "%PARALLEL%" -j%JOBS% "%CMD_FILE%"
+    if errorlevel 1 (
+        echo.
+        echo Error: CUDA compilation failed
+        exit /b 1
+    )
+) else (
+    echo All .cu files up to date.
+)
+echo.
+
+:: -------- compile core GGML sources with host compiler --------
+echo Compiling core GGML sources...
+
+set "HOST_FLAGS=/nologo /EHsc /O2 /GR /MT /Zc:preprocessor /DNDEBUG"
+set "HOST_FLAGS=%HOST_FLAGS% /DGGML_BUILD=1 /DGGML_SHARED=1 /DGGML_BACKEND_SHARED=1 /DGGML_BACKEND_BUILD=1 /DGGML_MULTIPLATFORM"
+set "HOST_FLAGS=%HOST_FLAGS% /DGGML_VERSION=\"!GGML_VERSION!\" /DGGML_COMMIT=\"!GGML_COMMIT!\""
+set "HOST_FLAGS=%HOST_FLAGS% /I"%GGML_INC_DIR%" /I"%GGML_SRC_DIR%""
+
+:: C sources
+for %%f in (ggml.c ggml-alloc.c ggml-quants.c) do (
+    set "SRC=%GGML_SRC_DIR%\%%f"
+    set "BASE=%%~nf"
+    set "OBJ=%BUILD_DIR%\ggml-core-!BASE!.obj"
+    if not exist "!OBJ!" (
+        echo   Compiling: %%f
+        cl /c %HOST_FLAGS% /Fo"!OBJ!" "!SRC!"
+        if errorlevel 1 (echo Error compiling %%f & exit /b 1)
+    ) else (
+        echo   Skipping: %%f (up to date^)
+    )
+)
+
+:: C++ sources
+for %%f in (ggml-backend.cpp ggml-backend-meta.cpp ggml-threading.cpp) do (
+    set "SRC=%GGML_SRC_DIR%\%%f"
+    set "BASE=%%~nf"
+    set "OBJ=%BUILD_DIR%\ggml-core-!BASE!.obj"
+    if not exist "!OBJ!" (
+        echo   Compiling: %%f
+        cl /c %HOST_FLAGS% /std:c++17 /Fo"!OBJ!" "!SRC!"
+        if errorlevel 1 (echo Error compiling %%f & exit /b 1)
+    ) else (
+        echo   Skipping: %%f (up to date^)
+    )
+)
+
+echo.
+
+:: -------- link --------
+echo Linking ggml-cuda.dll...
+:: Collect all .obj files into a response file (command line too long for cmd.exe)
+set "LINK_RSP=%BUILD_DIR%\link_objects.rsp"
+type nul > "%LINK_RSP%"
+for %%f in ("%BUILD_DIR%\*.obj") do echo "%%f">> "%LINK_RSP%"
+nvcc --shared %ARCH_FLAGS% -o "%OUTPUT%" -optf "%LINK_RSP%" %LINK_LIBS%
+if errorlevel 1 (
+    echo Error: linking failed
+    exit /b 1
+)
+
+if "%STRIP%"=="1" (
+    echo Note: --strip is a no-op on Windows ^(debug info is in a separate .pdb^)
+)
+
+echo.
+echo Successfully built: %OUTPUT%
+for %%f in ("%OUTPUT%") do echo   Size: %%~zf bytes
+echo.
+
+endlocal

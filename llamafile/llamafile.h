@@ -1,3 +1,21 @@
+// -*- mode:c;indent-tabs-mode:nil;c-basic-offset:4;coding:utf-8 -*-
+// vi: set et ft=c ts=4 sts=4 sw=4 fenc=utf-8 :vi
+//
+// Copyright 2024 Mozilla Foundation
+// Copyright 2026 Mozilla.ai
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #ifndef LLAMAFILE_H_
 #define LLAMAFILE_H_
 #include <stdbool.h>
@@ -6,93 +24,79 @@
 extern "C" {
 #endif
 
-extern bool FLAGS_READY;
-extern bool FLAG_ascii;
-extern bool FLAG_completion_mode;
-extern bool FLAG_fast;
-extern bool FLAG_iq;
-extern bool FLAG_log_disable;
-extern bool FLAG_mlock;
-extern bool FLAG_mmap;
-extern bool FLAG_no_display_prompt;
-extern bool FLAG_nocompile;
-extern bool FLAG_nologo;
-extern bool FLAG_precise;
-extern bool FLAG_recompile;
-extern bool FLAG_tinyblas;
-extern bool FLAG_trace;
-extern bool FLAG_trap;
-extern bool FLAG_unsecure;
-extern bool FLAG_v2;
-extern const char *FLAG_chat_template;
-extern const char *FLAG_db;
-extern const char *FLAG_db_startup_sql;
-extern const char *FLAG_file;
-extern const char *FLAG_ip_header;
-extern const char *FLAG_listen;
-extern const char *FLAG_mmproj;
-extern const char *FLAG_model;
-extern const char *FLAG_prompt;
-extern const char *FLAG_url_prefix;
-extern const char *FLAG_www_root;
-extern double FLAG_token_rate;
-extern float FLAG_decay_growth;
-extern float FLAG_frequency_penalty;
-extern float FLAG_presence_penalty;
-extern float FLAG_reserve_tokens;
-extern float FLAG_temperature;
-extern float FLAG_top_p;
-extern int FLAG_batch;
-extern int FLAG_ctx_size;
-extern int FLAG_decay_delay;
-extern int FLAG_flash_attn;
-extern int FLAG_gpu;
-extern int FLAG_gpu;
-extern int FLAG_http_ibuf_size;
-extern int FLAG_http_obuf_size;
-extern int FLAG_keepalive;
-extern int FLAG_main_gpu;
-extern int FLAG_n_gpu_layers;
-extern int FLAG_slots;
-extern int FLAG_split_mode;
-extern int FLAG_threads;
-extern int FLAG_threads_batch;
-extern int FLAG_token_burst;
-extern int FLAG_token_cidr;
-extern int FLAG_ubatch;
-extern int FLAG_verbose;
-extern int FLAG_warmup;
-extern int FLAG_workers;
-extern unsigned FLAG_seed;
+// =============================================================================
+// FLAGS - Global configuration variables (defined in llamafile.c)
+// =============================================================================
+
+extern bool FLAG_log_disable;   // Disables logging (chatbot_comm.cpp)
+extern bool FLAG_nocompile;     // Disables GPU library compilation (metal.c)
+extern bool FLAG_ascii;         // Uses ASCII art for logo (chatbot_logo.cpp)
+extern bool FLAG_nologo;        // Suppresses logo display (chatbot_main.cpp)
+extern bool FLAG_nothink;       // Filters thinking/reasoning content (chatbot_cli.cpp)
+extern bool FLAG_precise;       // Forces precise math in tinyblas (tinyblas_cpu.h)
+extern bool FLAG_recompile;     // Forces GPU library recompilation (metal.c)
+extern bool FLAG_unsecure;      // Disables pledge() sandboxing (sandbox.c)
+extern int FLAG_gpu;            // GPU backend selection (llamafile.c, metal.c, cuda.c)
+extern int FLAG_verbose;        // Verbose output (chatbot_main.cpp, metal.c, cuda.c)
+
+// =============================================================================
+// File I/O - GGUF file handling with zip support
+// Defined in llamafile.c, used internally for model loading
+// UNUSED externally: These are defined but not called from outside llamafile.c
+// =============================================================================
 
 struct llamafile;
-struct llamafile *llamafile_open_gguf(const char *, const char *);
-void llamafile_close(struct llamafile *);
-long llamafile_read(struct llamafile *, void *, size_t);
-long llamafile_write(struct llamafile *, const void *, size_t);
-bool llamafile_seek(struct llamafile *, size_t, int);
-void *llamafile_content(struct llamafile *);
-size_t llamafile_tell(struct llamafile *);
-size_t llamafile_size(struct llamafile *);
-size_t llamafile_position(struct llamafile *);
-bool llamafile_eof(struct llamafile *file);
-FILE *llamafile_fp(struct llamafile *);
-void llamafile_ref(struct llamafile *);
-void llamafile_unref(struct llamafile *);
-char *llamafile_get_prompt(void);
+struct llamafile *llamafile_open_gguf(const char *, const char *);  // UNUSED externally
+void llamafile_close(struct llamafile *);                           // UNUSED externally
+long llamafile_read(struct llamafile *, void *, size_t);            // UNUSED externally
+long llamafile_write(struct llamafile *, const void *, size_t);     // UNUSED externally
+bool llamafile_seek(struct llamafile *, size_t, int);               // UNUSED externally
+void *llamafile_content(struct llamafile *);                        // UNUSED externally
+size_t llamafile_tell(struct llamafile *);                          // UNUSED externally
+size_t llamafile_size(struct llamafile *);                          // UNUSED externally
+size_t llamafile_position(struct llamafile *);                      // UNUSED externally
+bool llamafile_eof(struct llamafile *file);                         // UNUSED externally
+FILE *llamafile_fp(struct llamafile *);                             // UNUSED externally
+void llamafile_ref(struct llamafile *);                             // UNUSED externally
+void llamafile_unref(struct llamafile *);                           // UNUSED externally
 
-void llamafile_govern(void);
-void llamafile_check_cpu(void);
-void llamafile_help(const char *);
-void llamafile_log_command(char *[]);
-const char *llamafile_get_tmp_dir(void);
+// =============================================================================
+// Utility functions
+// =============================================================================
+
+// NOT DEFINED: Declaration only, no implementation in llamafile_new/
+void llamafile_govern(void);                              // NOT DEFINED
+void llamafile_check_cpu(void);                           // NOT DEFINED
+void llamafile_help(const char *);                        // NOT DEFINED
+void llamafile_log_command(char *[]);                     // NOT DEFINED
+const char *llamafile_get_tmp_dir(void);                  // NOT DEFINED
+void llamafile_schlep(const void *, size_t);              // NOT DEFINED
+void llamafile_launch_browser(const char *);              // NOT DEFINED
+void llamafile_get_flags(int, char **);                   // NOT DEFINED
+char *llamafile_get_prompt(void);                         // NOT DEFINED
+
+// USED: Defined in llamafile.c
 bool llamafile_has(char **, const char *);
+void llamafile_get_app_dir(char *, size_t);
+void llamafile_set_app_name(const char *); // app dir basename, default "llamafile"
 bool llamafile_extract(const char *, const char *);
 int llamafile_is_file_newer_than(const char *, const char *);
-void llamafile_schlep(const void *, size_t);
-void llamafile_get_app_dir(char *, size_t);
-void llamafile_launch_browser(const char *);
-void llamafile_get_flags(int, char **);
+
+// Common utilities for GPU backend loaders (defined in llamafile.c)
+const char *llamafile_get_dso_extension(void);
+bool llamafile_file_exists(const char *);
+
+// Link function type for TryLoadPrebuiltDso
+typedef bool (*llamafile_link_dso_fn)(const char *dso_path);
+
+// Try to load a prebuilt DSO from /zip/, app dir, or home dir
+// Returns true if successfully loaded via link_fn
+bool llamafile_try_load_prebuilt_dso(const char *name, const char *backend_name,
+                                     llamafile_link_dso_fn link_fn);
+
+// =============================================================================
+// GPU detection and configuration
+// =============================================================================
 
 #define LLAMAFILE_GPU_ERROR -2
 #define LLAMAFILE_GPU_DISABLE -1
@@ -100,13 +104,97 @@ void llamafile_get_flags(int, char **);
 #define LLAMAFILE_GPU_AMD 1
 #define LLAMAFILE_GPU_APPLE 2
 #define LLAMAFILE_GPU_NVIDIA 4
-bool llamafile_has_gpu(void);
-int llamafile_gpu_layers(int);
-bool llamafile_has_cuda(void);
-bool llamafile_has_metal(void);
-bool llamafile_has_amd_gpu(void);
-int llamafile_gpu_parse(const char *);
-const char *llamafile_describe_gpu(void);
+#define LLAMAFILE_GPU_VULKAN 8
+
+bool llamafile_has_gpu(void);             // Defined in llamafile.c
+bool llamafile_has_metal(void);           // Defined in metal.c (dynamic loader)
+bool llamafile_has_cuda(void);            // Defined in cuda.c (dynamic loader)
+bool llamafile_has_amd_gpu(void);         // Defined in cuda.c (dynamic loader)
+bool llamafile_has_vulkan(void);          // Defined in vulkan.c (dynamic loader)
+int llamafile_gpu_parse(const char *);    // Defined in llamafile.c
+const char *llamafile_describe_gpu(void); // Defined in llamafile.c
+void llamafile_early_gpu_init(char **);   // Defined in llamafile.c
+
+// =============================================================================
+// Sandboxing - pledge()/SECCOMP + unveil()/Landlock (defined in sandbox.c)
+// =============================================================================
+
+// The pledge() syscall sandbox (no outbound network, no writes, no exec) is
+// applied by default. unveil() path confinement is opt-in (--confine-reads),
+// because locking the readable paths at startup is incompatible with files a
+// server opens by path at request time (multimodal media, etc.).
+
+#define LLAMAFILE_SANDBOX_FAILED -1          // pledge() failed, errno is set
+#define LLAMAFILE_SANDBOX_ACTIVE 0           // pledge() active
+#define LLAMAFILE_SANDBOX_UNSECURE 1         // skipped: --unsecure flag
+#define LLAMAFILE_SANDBOX_GPU 2              // skipped: GPU backend loaded
+#define LLAMAFILE_SANDBOX_UNSUPPORTED 3      // skipped: OS can't enforce pledge()
+#define LLAMAFILE_SANDBOX_ACTIVE_CONFINED 4  // pledge() active + unveil() applied
+#define LLAMAFILE_SANDBOX_ACTIVE_UNCONFINED 5 // pledge() active; unveil() asked
+                                             // for but filesystem can't enforce it
+
+extern bool FLAG_confine_reads;  // opt-in unveil() path confinement (sandbox.c)
+
+bool llamafile_sandbox_supported(void);         // Probe only, installs nothing
+int llamafile_sandbox_apply(const char *);      // Unconditional pledge()
+int llamafile_sandbox(const char *);            // Honors --unsecure and GPU mode
+int llamafile_sandbox_enter(const char *, bool);// sandbox() + perror/verbose report
+const char *llamafile_sandbox_describe(int);    // Status code -> human string
+bool llamafile_sandbox_is_active(int);          // true for the ACTIVE* statuses
+
+// Inputs to the server sandbox. read_paths are opened read-only (model,
+// mmproj, LoRA, draft model, control vectors, media dir, static web root);
+// rw_paths get write+create (slot-save dir, prompt cache). confine requests
+// unveil() path confinement; needs_outbound relaxes accept()-only networking
+// to full sockets when the server must dial out (--rpc, tools, MCP proxy).
+struct llamafile_sandbox_spec {
+    const char *const *read_paths;
+    int n_read;
+    const char *const *rw_paths;
+    int n_rw;
+    bool confine;
+    bool needs_outbound;
+};
+
+// Applies the server sandbox: pledge() always, plus unveil() when
+// spec->confine. Fills promises_out with the pledge string for logging.
+// Returns an ACTIVE* status (see describe()) or a skip/FAILED code.
+int llamafile_sandbox_server(const struct llamafile_sandbox_spec *spec,
+                             char *promises_out, size_t promises_len);
+
+// Pure promise-string derivation, exposed for unit testing.
+void llamafile_sandbox_server_promises(char *out, size_t len, bool is_openbsd,
+                                       bool has_rw, bool needs_outbound);
+
+// Removes every occurrence of flag from argv in place, updating *argc, and
+// returns true if it was present. Used to consume llamafile-only flags
+// (e.g. --unsecure) before handing argv to llama.cpp's parser. In llamafile.c.
+bool llamafile_consume_flag(int *argc, char **argv, const char *flag);
+
+// Log callback type for Metal backend (matches ggml_log_callback)
+typedef void (*llamafile_log_callback)(int level, const char *text, void *user_data);
+
+// No-op log callback to disable logging (defined in llamafile.c)
+void llamafile_log_callback_null(int level, const char *text, void *user_data);
+
+// Print an INFO-level diagnostic tagged with a backend name.
+// No-op unless FLAG_verbose is set. Adds the "<backend>: INFO: " prefix
+// and a trailing newline, so callers pass only the message body.
+// Defined in llamafile.c.
+void llamafile_info(const char *backend, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+// Set logging callback for Metal dylib (defined in metal.c)
+// Pass a no-op callback to disable logging
+void llamafile_metal_log_set(llamafile_log_callback log_callback, void *user_data);
+
+// Set logging callback for CUDA/ROCm dylib (defined in cuda.c)
+// Pass a no-op callback to disable logging
+void llamafile_cuda_log_set(llamafile_log_callback log_callback, void *user_data);
+
+// Set logging callback for Vulkan dylib (defined in vulkan.c)
+// Pass a no-op callback to disable logging
+void llamafile_vulkan_log_set(llamafile_log_callback log_callback, void *user_data);
 
 #ifdef __cplusplus
 }

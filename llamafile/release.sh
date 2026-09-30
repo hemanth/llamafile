@@ -1,90 +1,65 @@
-#!/bin/bash
+# update LLAMAFILE_VERSION for a new release
+LLAMAFILE_VERSION="0.10.7"
 
-# Default values
-VERSION=""
-SOURCE_DIR=""
-DEST_DIR=""
+# this is where the precompiled GPU libraries are stored
+GPU_LIBS_DIR="/home/mala/gpulibs/${LLAMAFILE_VERSION}"
 
-# Function to display help
-show_help() {
-  echo "Usage: $0 [OPTIONS]"
-  echo
-  echo "Script to copy and rename binary files with version numbers."
-  echo
-  echo "Options:"
-  echo "  -v, --version VERSION     Version number to append to filenames (required)"
-  echo "  -s, --source DIR          Source directory containing the binaries (required)"
-  echo "  -d, --dest DIR            Destination directory for renamed binaries (required)"
-  echo "  -h, --help                Display this help message and exit"
-  echo
-  echo "Example:"
-  echo "  $0 -v 0.9.2 -s /llamafile-release/0.9.2/llamafile-0.9.2/bin -d /llamafile-release/0.9.2/release"
-  echo
-}
+# this is where all the release files are gonna be saved
+RELEASE_DIR="/home/mala/releases/${LLAMAFILE_VERSION}"
 
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    -v|--version)
-      VERSION="$2"
-      shift 2
-      ;;
-    -s|--source)
-      SOURCE_DIR="$2"
-      shift 2
-      ;;
-    -d|--dest)
-      DEST_DIR="$2"
-      shift 2
-      ;;
-    -h|--help)
-      show_help
-      exit 0
-      ;;
-    *)
-      echo "Error: Unknown option: $1"
-      show_help
-      exit 1
-      ;;
-  esac
-done
+# this is where the zip package contents are being collected
+ZIP_DIR="${RELEASE_DIR}/llamafile-${LLAMAFILE_VERSION}"
 
-# Check if required arguments are provided
-if [ -z "$VERSION" ] || [ -z "$SOURCE_DIR" ] || [ -z "$DEST_DIR" ]; then
-  echo "Error: Missing required arguments"
-  show_help
+# run make install to store binaries and man pages in ZIP_DIR
+make install PREFIX="${ZIP_DIR}"
+
+# Check if make install actually created ZIP_DIR
+if [ ! -d "${ZIP_DIR}" ]; then
+  echo "Error: Source directory does not exist: ${ZIP_DIR}"
   exit 1
 fi
 
-# Check if source directory exists
-if [ ! -d "$SOURCE_DIR" ]; then
-  echo "Error: Source directory does not exist: $SOURCE_DIR"
-  exit 1
-fi
+# Copy the README into the release
+cp README.md "${ZIP_DIR}/README.md"
 
-# Create destination directory if it doesn't exist
-mkdir -p "$DEST_DIR"
+# Make a copy of llamafile while it's thin
+cp "${ZIP_DIR}/bin/llamafile" "${ZIP_DIR}/bin/llamafile-thin"
 
-# List of binaries to copy and rename
-BINARIES=(
-  "llamafile"
-  "llamafile-bench"
-  "llamafiler"
-  "sdfile"
-  "localscore"
-  "whisperfile"
-  "zipalign"
-)
+# Bundle llamafile binary with GPU libs
+${ZIP_DIR}/bin/zipalign -j0 "${ZIP_DIR}/bin/llamafile" \
+	"${GPU_LIBS_DIR}/ggml-cuda.so"                 \
+	"${GPU_LIBS_DIR}/ggml-cuda.dll"                \
+	"${GPU_LIBS_DIR}/ggml-vulkan.so"               \
+	"${GPU_LIBS_DIR}/ggml-vulkan.dll" 
 
-# Copy and rename each binary
-for binary in "${BINARIES[@]}"; do
-  if [ -f "${SOURCE_DIR}/${binary}" ]; then
-    cp "${SOURCE_DIR}/${binary}" "${DEST_DIR}/${binary}-${VERSION}"
-    echo "Copied ${binary} to ${DEST_DIR}/${binary}-${VERSION}"
+DEST_DIR="${RELEASE_DIR}/release"
+mkdir "${DEST_DIR}"
+
+# list of binaries to copy and rename
+BINARIES="llamafile zipalign whisperfile diffusionfile transcribefile"
+
+for binary in $BINARIES; do
+  if [ -f "${ZIP_DIR}/bin/${binary}" ]; then
+    cp "${ZIP_DIR}/bin/${binary}" "${DEST_DIR}/${binary}-${LLAMAFILE_VERSION}"
+    echo "Copied ${binary} to ${DEST_DIR}/${binary}-${LLAMAFILE_VERSION}"
   else
-    echo "Warning: ${SOURCE_DIR}/${binary} not found"
+    echo "Warning: ${ZIP_DIR}/bin/${binary} not found"
   fi
 done
 
-# Make all binaries in destination directory executable
-chmod +x "${DEST_DIR}"/*
+# move the thin llamafile in the release dir (we are not packing both in the zip)
+mv "${ZIP_DIR}/bin/llamafile-thin" "${DEST_DIR}/llamafile-${LLAMAFILE_VERSION}-thin"
+
+ZIP_FILE="${DEST_DIR}/llamafile-${LLAMAFILE_VERSION}.zip"
+
+echo "Zipping ${ZIP_DIR} into ${ZIP_FILE}"
+
+# now zip the release directory
+cd "${RELEASE_DIR}"
+zip -r "${ZIP_FILE}" "llamafile-${LLAMAFILE_VERSION}"
+
+if [ -f "${ZIP_FILE}" ]; then
+  echo "${ZIP_FILE} ready."
+else
+  echo "Error creating ${ZIP_FILE}"
+fi

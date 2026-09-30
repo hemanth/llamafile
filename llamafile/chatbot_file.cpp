@@ -21,11 +21,12 @@
 #include <sys/stat.h>
 #include <vector>
 
-#include "llama.cpp/common.h"
-#include "llamafile/color.h"
-#include "llamafile/image.h"
-#include "llamafile/llama.h"
-#include "llamafile/string.h"
+#include "common.h"
+#include "llama.h"
+#include "color.h"
+#include "image.h"
+#include "llama.h"  // llamafile wrapper
+#include "string.h"
 
 namespace lf {
 namespace chatbot {
@@ -33,6 +34,7 @@ namespace chatbot {
 static bool has_binary(const std::string_view s) {
     return s.find('\0') != std::string_view::npos;
 }
+
 
 void on_upload(const std::vector<std::string> &args) {
     if (args.size() < 2) {
@@ -51,7 +53,6 @@ void on_upload(const std::vector<std::string> &args) {
         err("%s: file does not exist", path);
         return;
     }
-    int tokens_used_before = tokens_used();
     std::string content;
     if (!slurp(&content, path)) {
         err("%s: failed to slurp file", path);
@@ -64,7 +65,9 @@ void on_upload(const std::vector<std::string> &args) {
     markdown += iso8601(st.st_mtim);
     markdown += "\n\n";
     if (is_image(content)) {
-        if (!g_clip) {
+        // In direct mode, need multimodal context loaded locally.
+        // In API mode (g_model==null), the server handles multimodal.
+        if (g_model && !g_mtmd) {
             err("%s: need --mmproj model to process images", path);
             return;
         }
@@ -83,14 +86,13 @@ void on_upload(const std::vector<std::string> &args) {
             markdown += '\n';
         markdown += "``````";
     }
-    std::vector<llama_chat_msg> chat = {{"system", std::move(markdown)}};
-    if (!eval_string(
-            llama_chat_apply_template(g_model, g_params.chat_template, chat, DONT_ADD_ASSISTANT),
-            DONT_ADD_SPECIAL, PARSE_SPECIAL)) {
-        rewind(tokens_used_before);
-        return;
+    // Store content for inclusion with next user message.
+    // This avoids template validation errors in models like Qwen3.5 that
+    // require user messages to be present when applying the template.
+    if (!g_pending_file_content.empty()) {
+        g_pending_file_content += "\n\n";
     }
-    llama_synchronize(g_ctx);
+    g_pending_file_content += markdown;
 }
 
 } // namespace chatbot

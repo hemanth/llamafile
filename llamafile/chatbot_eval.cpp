@@ -2,6 +2,7 @@
 // vi: set et ft=cpp ts=4 sts=4 sw=4 fenc=utf-8 :vi
 //
 // Copyright 2024 Mozilla Foundation
+// Copyright 2026 Mozilla.ai
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +17,15 @@
 // limitations under the License.
 
 #include "chatbot.h"
-#include "llama.cpp/base64.h"
-#include "llama.cpp/common.h"
-#include "llama.cpp/llama.h"
-#include "llama.cpp/llava/llava.h"
-#include "llamafile/datauri.h"
-#include "llamafile/image.h"
-#include "llamafile/llama.h"
-#include "llamafile/string.h"
+#include "base64.hpp"
+#include "common.h"
+#include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
+#include "datauri.h"
+#include "image.h"
+#include "llama.h"  // llamafile wrapper
+#include "string.h"
 #include <cassert>
 #include <string>
 #include <vector>
@@ -35,78 +37,29 @@ bool eval_tokens(std::vector<llama_token> tokens) {
     int N = (int)tokens.size();
     if (tokens_used() + N > llama_n_ctx(g_ctx))
         return out_of_context(N);
-    for (int i = 0; i < N; i += g_params.n_batch) {
+    for (int i = 0; i < N; i += g_params->n_batch) {
         if (g_got_sigint) {
             g_got_sigint = false;
             clear_ephemeral();
             return false;
         }
-        if (N > g_params.n_batch)
+        if (N > g_params->n_batch)
             print_ephemeral(format("loading prompt %d%%...", (int)((double)i / N * 100)));
         int n_eval = (int)tokens.size() - i;
-        if (n_eval > g_params.n_batch)
-            n_eval = g_params.n_batch;
-        if (llama_decode(g_ctx, llama_batch_get_one(&tokens[i], n_eval, tokens_used(), 0)))
+        if (n_eval > g_params->n_batch)
+            n_eval = g_params->n_batch;
+        if (llama_decode(g_ctx, llama_batch_get_one(&tokens[i], n_eval)))
             return out_of_context(n_eval);
         g_history.insert(g_history.end(), tokens.begin() + i, tokens.begin() + i + n_eval);
     }
     clear_ephemeral();
     // this function is what computes /stats. we need to call it now
     // since llama_decode() kicks the can down the road to functions
-    // like llama_sampling_sample(). that is bad because the chatbot
+    // like common_sampler_sample(). that is bad because the chatbot
     // returns control to the repl rather than sampling when loading
     // system and image prompts.
     llama_synchronize(g_ctx);
     return true;
-}
-
-bool eval_image_embed(const llava_image_embed *image_embed) {
-    int N = image_embed->n_image_pos;
-    if (tokens_used() + N > llama_n_ctx(g_ctx))
-        return out_of_context(N);
-    int n_embd = llama_n_embd(llama_get_model(g_ctx));
-    for (int i = 0; i < N; i += g_params.n_batch) {
-        if (g_got_sigint) {
-            g_got_sigint = false;
-            clear_ephemeral();
-            return false;
-        }
-        if (N > g_params.n_batch)
-            print_ephemeral(format("loading image %d%%...", (int)((double)i / N * 100)));
-        int n_eval = N - i;
-        if (n_eval > g_params.n_batch)
-            n_eval = g_params.n_batch;
-        llama_batch batch = {
-            .n_tokens = n_eval,
-            .embd = image_embed->embed + i * n_embd,
-            .all_pos_0 = tokens_used(),
-            .all_pos_1 = 1,
-            .all_seq_id = 0,
-        };
-        if (llama_decode(g_ctx, batch))
-            return out_of_context(n_eval);
-        for (int i = 0; i < n_eval; ++i)
-            g_history.push_back(IMAGE_PLACEHOLDER_TOKEN);
-    }
-    clear_ephemeral();
-    llama_synchronize(g_ctx);
-    return true;
-}
-
-bool eval_image(const std::string_view binary) {
-    unassert(g_clip);
-    llava_image_embed *image_embed;
-    print_ephemeral("analyzing image...");
-    image_embed = llava_image_embed_make_with_bytes(
-        g_clip, FLAG_threads_batch, (const unsigned char *)binary.data(), binary.size());
-    clear_ephemeral();
-    if (!image_embed) {
-        err("failed to load image");
-        return false;
-    }
-    bool ok = eval_image_embed(image_embed);
-    llava_image_embed_free(image_embed);
-    return ok;
 }
 
 bool eval_token(int id) {
@@ -117,34 +70,139 @@ bool eval_plain_text(const std::string &str, bool add_special, bool parse_specia
     return eval_tokens(llamafile_tokenize(g_model, str, add_special, parse_special));
 }
 
-bool eval_string(std::string_view s, bool add_special, bool parse_special) {
-    size_t i = 0;
-    for (;;) {
-        size_t pos = s.find("data:", i);
-        if (pos == std::string_view::npos)
-            return eval_plain_text(std::string(s), add_special, parse_special);
-        i = pos + 5;
-        DataUri uri;
-        size_t end = uri.parse(s.substr(pos + 5));
-        if (end == std::string_view::npos)
-            continue;
-        if (!lf::startscasewith(uri.mime, "image/"))
-            continue;
-        std::string image;
-        try {
-            image = uri.decode();
-        } catch (const base64_error &e) {
-            continue;
+// Helper to evaluate chunks from mtmd_tokenize and update g_history.
+// Uses mtmd_helper_eval_chunk_single() for consistency with llama.cpp server.
+// Tracks n_past explicitly to handle M-RoPE models where n_pos != n_tokens.
+static bool eval_mtmd_chunks(mtmd_input_chunks *chunks) {
+    size_t n_chunks = mtmd_input_chunks_size(chunks);
+
+    // Check context using n_pos (not n_tokens) for M-RoPE compatibility
+    llama_pos total_pos = mtmd_helper_get_n_pos(chunks);
+    if (tokens_used() + total_pos > llama_n_ctx(g_ctx))
+        return out_of_context(total_pos);
+
+    // Track position explicitly across chunks (like llama.cpp server)
+    llama_pos n_past = tokens_used();
+
+    // Evaluate each chunk using the same helper as llama.cpp server
+    for (size_t i = 0; i < n_chunks; i++) {
+        if (g_got_sigint) {
+            g_got_sigint = false;
+            clear_ephemeral();
+            return false;
         }
-        if (!is_image(image))
-            continue;
-        if (!eval_plain_text(std::string(s.substr(0, pos)), add_special, parse_special))
+
+        const mtmd_input_chunk *chunk = mtmd_input_chunks_get(chunks, i);
+        auto chunk_type = mtmd_input_chunk_get_type(chunk);
+
+        // Show progress for large prompts or image processing
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+            if ((int)n_tokens > g_params->n_batch)
+                print_ephemeral("loading prompt...");
+        } else {
+            print_ephemeral("processing image...");
+        }
+
+        // Use the same helper function as llama.cpp server
+        llama_pos new_n_past = n_past;
+        int32_t ret = mtmd_helper_eval_chunk_single(
+            g_mtmd, g_ctx, chunk,
+            n_past,
+            0,  // seq_id
+            g_params->n_batch,
+            true,  // logits_last
+            &new_n_past);
+
+        if (ret != 0) {
+            if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT)
+                err("failed to evaluate text chunk");
+            else
+                err("failed to evaluate image chunk");
             return false;
-        if (!eval_image(image))
-            return false;
-        s = s.substr(i + end);
-        i = 0;
+        }
+
+        // Update history for context tracking
+        // Use n_pos (not n_tokens) for M-RoPE model compatibility
+        llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk);
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            // Add actual tokens to history
+            size_t n_text_tokens;
+            const llama_token *tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_text_tokens);
+            g_history.insert(g_history.end(), tokens, tokens + n_text_tokens);
+        } else {
+            // Add placeholder tokens for image/audio (use n_pos for M-RoPE)
+            for (llama_pos j = 0; j < n_pos; j++) {
+                g_history.push_back(IMAGE_PLACEHOLDER_TOKEN);
+            }
+        }
+
+        // Update position for next chunk
+        n_past = new_n_past;
     }
+
+    clear_ephemeral();
+    llama_synchronize(g_ctx);
+    return true;
+}
+
+// Evaluate a string that may contain embedded data URIs for images.
+// Images are processed using the mtmd API which requires tokenizing
+// text and images together.
+bool eval_string(std::string_view s, bool add_special, bool parse_special) {
+    // Extract data URIs from the input
+    DataUriExtraction extraction = extract_data_uris(s, mtmd_default_marker());
+
+    // If no images found, just evaluate as plain text
+    if (extraction.images.empty()) {
+        return eval_plain_text(std::string(s), add_special, parse_special);
+    }
+
+    // We have images - check if we have multimodal support
+    if (!g_mtmd) {
+        err("multimodal model not loaded (use --mmproj to specify vision model)");
+        return false;
+    }
+
+    // Create bitmaps from decoded image data
+    mtmd::bitmaps bitmaps;
+    for (const auto &image : extraction.images) {
+        // init_from_buf returns a wrapper {bitmap, video_ctx}; chatbot is
+        // image-only, so take the bitmap (placeholder=false loads real pixels)
+        // and the default opt (its video params go unused).
+        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(
+            g_mtmd, (const unsigned char *)image.data(), image.size(), false,
+            mtmd_helper_init_opt_default()).bitmap);
+        if (!bmp.ptr) {
+            err("failed to load image");
+            return false;
+        }
+        bitmaps.entries.push_back(std::move(bmp));
+    }
+
+    // Use mtmd_tokenize to process text with images
+    mtmd_input_text text;
+    text.text = extraction.modified_text.c_str();
+    text.text_len = extraction.modified_text.size();
+    text.add_special = add_special;
+    text.parse_special = parse_special;
+
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    auto bitmaps_c_ptr = bitmaps.c_ptr();
+    int32_t res = mtmd_tokenize(g_mtmd, chunks.ptr.get(), &text,
+                                bitmaps_c_ptr.data(), bitmaps_c_ptr.size());
+    if (res != 0) {
+        if (res == 1)
+            err("number of images doesn't match number of markers in prompt");
+        else if (res == 2)
+            err("image preprocessing error");
+        else
+            err("failed to tokenize prompt with images (error %d)", res);
+        return false;
+    }
+
+    // Evaluate the chunks
+    return eval_mtmd_chunks(chunks.ptr.get());
 }
 
 } // namespace chatbot

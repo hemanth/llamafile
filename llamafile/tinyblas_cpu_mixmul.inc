@@ -250,6 +250,22 @@ class MixMul {
             return false;
 #endif
 
+        case GGML_TYPE_Q1_0:
+            // Upstream Q1_0 uses 128-element blocks (QK1_0=128), so the
+            // BS template arg must be 128: mixmat passes cols/BS as the
+            // kernel's per-row block count.
+            if (thought->type != GGML_TYPE_F32 && thought->type != GGML_TYPE_Q8_0)
+                return false;
+#if defined(__AVX2__) || defined(__AVX512F__)
+            return mixmat<128, 128, tinyBLAS_Q0_g128_AVX2<NCB | NCC, TC>,
+                          block_q1_0, block_q8_0, TC>();
+#elif defined(__ARM_FEATURE_DOTPROD)
+            return mixmat<128, 128, tinyBLAS_Q0_g128_ARM<NCB | NCC, TC>,
+                          block_q1_0, block_q8_0, TC>();
+#else
+            return false;
+#endif
+
         case GGML_TYPE_Q8_0:
             if (thought->type != GGML_TYPE_F32 && thought->type != GGML_TYPE_Q8_0)
                 return false;
@@ -275,7 +291,7 @@ class MixMul {
         if (thought->type != ggml_type_trait<TB>::id)
             quantize_thought(ggml_type_trait<TB>::id);
         build_row_pointers(ggml_type_trait<TB>::id);
-        ggml_barrier(params);
+        ggml_barrier(params->threadpool);
         assert(!(cols % BS));
         assert(!(weights->nb[1] % sizeof(TA)));
         // TODO(jart): parallelize this loop
@@ -340,7 +356,7 @@ class MixMul {
             ggml_fp32_to_bf16_row(src, (ggml_bf16_t *)dst, cols);
             break;
         case GGML_TYPE_Q8_0:
-            quantize_row_q8_0((const float *)src, (block_q8_0 *)dst, cols);
+            quantize_row_q8_0_ref((const float *)src, (block_q8_0 *)dst, cols);
             break;
         default:
             GGML_UNREACHABLE();

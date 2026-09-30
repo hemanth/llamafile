@@ -19,8 +19,8 @@
 
 #include <cstdio>
 
-#include "llamafile/color.h"
-#include "llamafile/llamafile.h"
+#include "color.h"
+#include "llamafile.h"
 
 namespace lf {
 namespace chatbot {
@@ -46,10 +46,11 @@ static void print_logo(const char16_t *s) {
     }
 }
 
-void logo(char **argv) {
-    if (llamafile_has(argv, "--nologo"))
+void logo(char **) {
+    if (FLAG_nologo) {
         return;
-    if (llamafile_has(argv, "--ascii")) {
+    }
+    if (FLAG_ascii) {
         printf("\
  _ _                        __ _ _\n\
 | | | __ _ _ __ ___   __ _ / _(_) | ___\n\

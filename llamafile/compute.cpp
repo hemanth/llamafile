@@ -18,10 +18,16 @@
 #include "compute.h"
 
 #include <cosmo.h>
+#include <cstring>
 #include <libc/intrin/x86.h>
 #include <sys/auxv.h>
 
-#include "llama.cpp/string.h"
+#include "common.h"
+#include "sgemm.h"
+
+static bool starts_with_str(const char *str, const char *prefix) {
+    return strncmp(str, prefix, strlen(prefix)) == 0;
+}
 
 #ifdef __x86_64__
 static void cpuid(unsigned leaf, unsigned subleaf, unsigned *info) {
@@ -58,7 +64,7 @@ std::string llamafile_describe_cpu() {
             char buf[1024];
             while (fgets(buf, sizeof(buf), f)) {
                 if (!strncmp(buf, "model name", 10) ||
-                    startswith(buf, "Model\t\t:")) { // e.g. raspi
+                    starts_with_str(buf, "Model\t\t:")) { // e.g. raspi
                     char *p = strchr(buf, ':');
                     if (p) {
                         p++;
@@ -74,36 +80,44 @@ std::string llamafile_describe_cpu() {
             fclose(f);
         }
     }
-    if (IsXnu()) {
-        char cpu_name[128] = {0};
-        size_t size = sizeof(cpu_name);
-        if (sysctlbyname("machdep.cpu.brand_string", cpu_name, &size, NULL, 0) != -1)
-            id = cpu_name;
-    }
 #endif
-    id = replace_all(id, " 96-Cores", "");
-    id = replace_all(id, "(TM)", "");
-    id = replace_all(id, "(R)", "");
+    string_replace_all(id, " 96-Cores", "");
+    string_replace_all(id, "(TM)", "");
+    string_replace_all(id, "(R)", "");
 
-    std::string march;
+    // Add sgemm kernel info (this describes the CPU capabilities used)
+    const char *sgemm = llamafile_sgemm_name();
+    if (sgemm && strcmp(sgemm, "unsupported") != 0) {
+        if (!id.empty())
+            id += " ";
+        id += "(";
+        id += sgemm;
+        id += ")";
+    } else {
+        // Fallback: show march info if no sgemm kernel
 #ifdef __x86_64__
-    if (__cpu_march(__cpu_model.__cpu_subtype))
-        march = __cpu_march(__cpu_model.__cpu_subtype);
-#else
-    long hwcap = getauxval(AT_HWCAP);
-    if (hwcap & HWCAP_ASIMDHP)
-        march += "+fp16";
-    if (hwcap & HWCAP_ASIMDDP)
-        march += "+dotprod";
-#endif
-
-    if (!march.empty()) {
-        bool empty = id.empty();
-        if (!empty)
-            id += " (";
-        id += march;
-        if (!empty)
+        if (__cpu_march(__cpu_model.__cpu_subtype)) {
+            if (!id.empty())
+                id += " ";
+            id += "(";
+            id += __cpu_march(__cpu_model.__cpu_subtype);
             id += ")";
+        }
+#else
+        std::string march;
+        long hwcap = getauxval(AT_HWCAP);
+        if (hwcap & HWCAP_ASIMDHP)
+            march += "+fp16";
+        if (hwcap & HWCAP_ASIMDDP)
+            march += "+dotprod";
+        if (!march.empty()) {
+            if (!id.empty())
+                id += " ";
+            id += "(";
+            id += march;
+            id += ")";
+        }
+#endif
     }
 
     return id;

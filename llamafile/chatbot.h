@@ -16,10 +16,15 @@
 // limitations under the License.
 
 #pragma once
-#include <__fwd/string.h>
-#include <__fwd/string_view.h>
-#include <__fwd/vector.h>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
 #include <signal.h>
+
+#include "chat.h"
+#include "chatbot_backend.h"
 
 #define DEFAULT_SYSTEM_PROMPT \
     "A chat between a curious human and an artificial intelligence assistant. " \
@@ -27,10 +32,11 @@
     "human's questions."
 
 struct bestlineCompletions;
-struct clip_ctx;
-struct gpt_params;
+struct common_params;
+struct common_sampler;
 struct llama_context;
 struct llama_model;
+struct mtmd_context;
 
 namespace lf {
 namespace chatbot {
@@ -45,21 +51,47 @@ enum SpecialToken {
     IMAGE_PLACEHOLDER_TOKEN = -31337,
 };
 
+// Result of extracting data URIs from text
+struct DataUriExtraction {
+    std::string modified_text;           // text with data URIs replaced by marker
+    std::vector<std::string> images;     // decoded image data
+    const char *marker;                  // marker string used for replacement
+};
+
 extern bool g_manual_mode;
 extern bool g_said_something;
 extern char g_last_printed_char;
-extern clip_ctx *g_clip;
+extern mtmd_context *g_mtmd;          // multimodal context (replaces g_clip)
 extern enum Role g_role;
-extern gpt_params g_params;
-extern int g_system_prompt_tokens;
+extern common_params *g_params;       // pointer to params (replaces gpt_params)
+extern common_sampler *g_sampler;     // sampler context (new)
+extern std::vector<common_chat_msg> g_messages;  // chat message history
 extern llama_context *g_ctx;
 extern llama_model *g_model;
 extern std::vector<int> g_history;
 extern volatile sig_atomic_t g_got_sigint;
+extern bool g_interrupted_exit;
+extern common_chat_templates_ptr g_chat_templates;
+extern common_chat_parser_params g_chat_syntax;
+extern std::string g_pending_file_content;  // accumulated /upload content awaiting user message
+extern ChatBackend *g_backend;               // active inference backend
 
-int main(int, char **);
+// Original entry point: loads its own model (--chat mode)
+int main(int argc, char **argv);
+
+// API client entry point for combined mode (HTTP client to local server)
+int api_main(const std::string &server_url, const std::string &system_prompt,
+             const std::string &model_path, std::function<void()> shutdown_fn);
+
+// CLI mode: single prompt -> response, then exit
+int cli_main(int argc, char **argv);
+
+// Backend factories
+std::unique_ptr<ChatBackend> create_direct_backend();
+std::unique_ptr<ChatBackend> create_api_backend(const std::string &server_url);
 
 bool eval_string(std::string_view, bool, bool);
+DataUriExtraction extract_data_uris(std::string_view, const char *marker);
 bool eval_token(int);
 bool eval_tokens(std::vector<int>);
 bool handle_command(const char *);
@@ -93,7 +125,7 @@ void on_upload(const std::vector<std::string> &);
 void print(const std::string_view &);
 void print_ephemeral(const std::string_view &);
 void record_undo(void);
-void repl();
+void repl(ChatBackend &backend);
 void rewind(int);
 
 } // namespace chatbot

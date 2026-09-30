@@ -19,8 +19,9 @@
 #include <type_traits>
 #if defined __x86_64__ || defined __aarch64__
 
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
+#include "ggml-impl.h"
+#include "ggml-quants.h"
+#include "ggml-cpu-impl.h"
 #include "sgemm.h"
 
 // For i-quants, I had to explicitely specify which
@@ -38,7 +39,22 @@
 #endif
 
 #define GGML_COMMON_IMPL_C
-#include "llama.cpp/ggml-common.h"
+#include "ggml-common.h"
+
+// IQK requires these packed block types for ARM NEON optimizations
+// These were originally added to ggml-common.h by kawrakow
+#if defined(__aarch64__)
+typedef struct {
+    ggml_half d[8];
+    int8_t qs[4*QK8_1];
+} block_q8_1_x4;
+static_assert(sizeof(block_q8_1_x4) == 4*sizeof(block_q8_1), "wrong q8_1_x4 block size/padding");
+typedef struct {
+    ggml_half d[4];
+    int8_t qs[4*QK8_0];
+} block_q8_0_x4;
+static_assert(sizeof(block_q8_0_x4) == 4*sizeof(block_q8_0), "wrong q8_0_x4 block size/padding");
+#endif
 
 // clang-format off
 
@@ -752,6 +768,27 @@ inline void multiply_add(const Bits& bits, const __m256i * scales, int j, int i,
     }
 }
 
+// Like multiply_add, but for signed int8 values (iq4_xs). maddubs needs an
+// unsigned first operand, so multiply |v| by sign(v)*q8; pair sums stay
+// within int16 range because |v| <= 127.
+template <typename Q8, typename Bits>
+inline void multiply_add_iq4xs(const Bits& bits, const __m256i * scales, int j, int i, const Q8& q8, __m256i * sumi) {
+    for (int iy = 0; iy < Q8::nrc_y; ++iy) {
+        __m256i p[4];
+        for (int k = 0; k < 4; ++k) {
+            const __m256i av = _mm256_sign_epi8(bits.values[k], bits.values[k]);
+            const __m256i sy = _mm256_sign_epi8(q8.load_quants(iy, i, 4*j+k), bits.values[k]);
+            p[k] = _mm256_madd_epi16(scales[k], _mm256_maddubs_epi16(av, sy));
+        }
+        if (j == 0) {
+            sumi[iy] = _mm256_add_epi32(_mm256_add_epi32(p[0], p[2]), _mm256_add_epi32(p[1], p[3]));
+        } else {
+            sumi[iy] = _mm256_add_epi32(sumi[iy], _mm256_add_epi32(p[0], p[2]));
+            sumi[iy] = _mm256_add_epi32(sumi[iy], _mm256_add_epi32(p[1], p[3]));
+        }
+    }
+}
+
 struct DequantizerQ4K final : public BaseDequantizer<block_q4_K> {
     DequantizerQ4K(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {}
     template <typename Q8>
@@ -773,7 +810,6 @@ struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
     inline __m256i new_block(int i, const Q8& q8, __m256 * accd) {
         d = GGML_FP16_TO_FP32(x[i].d);
         auto scales128 = siq4.make_scales(*(const uint32_t *)x[i].scales_l, x[i].scales_h);
-        s8k.accum_mins(scales128, q8, i, -128.f*d, accd);
         return MM256_SET_M128I(scales128, scales128);
     }
     inline void prepare(int i, int j) {
@@ -785,13 +821,17 @@ struct DequantizerIQ4XS final : public BaseDequantizer<block_iq4_xs> {
     }
 
     static __m256i load_values() {
-        static const uint8_t kvalues_iq4nl[16] = {1, 24, 45, 63, 79, 93, 106, 118, 129, 141, 153, 166, 181, 197, 217, 241};
+        // Signed iq4_nl values. The +128 offset trick used on the AVX-512
+        // (FANCY_SIMD) path is not usable here: _mm256_maddubs_epi16 pair
+        // sums of offset values (up to 241) times q8 (up to 127) overflow
+        // and saturate int16 (2*241*127 > 32767). Signed values stay within
+        // range with the sign trick in multiply_add_iq4xs.
+        static const int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
         auto val128 = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
         return MM256_SET_M128I(val128, val128);
     }
 
     Q4Bits bits;
-    Scales8K s8k;
     ScaleIQ4XS siq4;
     const __m256i values;
 };
@@ -976,7 +1016,11 @@ static void mul_mat_qX_K_q8_K_T(int n, const void * vx, size_t bx, const DataInf
 
                 set_scales_8(all_scales, j, scales);
 
-                multiply_add(deq.bits, scales, j, i, q8, sumi);
+                if constexpr (std::is_same_v<Dequantizer, DequantizerIQ4XS>) {
+                    multiply_add_iq4xs(deq.bits, scales, j, i, q8, sumi);
+                } else {
+                    multiply_add(deq.bits, scales, j, i, q8, sumi);
+                }
 
             }
 
@@ -1407,8 +1451,6 @@ template <typename Dequantizer> void MulMat::set_functions(MulMat& m) {
 
 bool MulMat::set_mul_mat(int typeA, int ne00, MulMat& mm, int& row_size_q8, int) {
 
-    row_size_q8 = ggml_row_size(GGML_TYPE_Q8_K, ne00);
-
     switch (typeA) {
         case GGML_TYPE_Q2_K:
             assert (ne00 % QK_K == 0);
@@ -1438,27 +1480,29 @@ bool MulMat::set_mul_mat(int typeA, int ne00, MulMat& mm, int& row_size_q8, int)
             assert (ne00 % QK4_0 == 0);
             MulMat::set_functions<Q4_0_Unpacker>(mm);
             row_size_q8 = ggml_row_size(GGML_TYPE_Q8_0, ne00);
-            break;
+            return true;
         case GGML_TYPE_Q4_1:
             assert (ne00 % QK4_1 == 0);
             MulMat::set_functions<Q4_1_Unpacker>(mm);
             row_size_q8 = ggml_row_size(GGML_TYPE_Q8_1, ne00);
-            break;
+            return true;
         case GGML_TYPE_Q5_0:
             assert (ne00 % QK5_0 == 0);
             MulMat::set_functions<Q5_0_Unpacker>(mm);
             row_size_q8 = ggml_row_size(GGML_TYPE_Q8_0, ne00);
-            break;
+            return true;
         case GGML_TYPE_Q5_1:
             assert (ne00 % QK5_1 == 0);
             MulMat::set_functions<Q5_1_Unpacker>(mm);
             row_size_q8 = ggml_row_size(GGML_TYPE_Q8_1, ne00);
-            break;
+            return true;
 
         default:
             return false;
     }
 
+    // Only K-quant types reach here (they break out of the switch above)
+    row_size_q8 = ggml_row_size(GGML_TYPE_Q8_K, ne00);
     return true;
 }
 
@@ -2555,22 +2599,45 @@ inline int32x4_t sum_4_blocks(const int8x16_t * b, const int8_t * qs) {
     return vpaddq_s32(p1234, vpaddq_s32(p56, p78));
 }
 
+// Strided version for unpacked block_q8_0 data where qs arrays are not contiguous
+// stride = sizeof(block_q8_0) = 34 bytes between consecutive blocks
+inline int32x4_t sum_4_blocks_strided(const int8x16_t * b, const int8_t * qs, size_t stride) {
+    auto q8b = vld1q_s8_x2(qs);
+    auto p12 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), b[0], q8b.val[0]), b[1], q8b.val[1]);
+    q8b = vld1q_s8_x2(qs + stride);
+    auto p34 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), b[2], q8b.val[0]), b[3], q8b.val[1]);
+    auto p1234 = vpaddq_s32(p12, p34);
+    q8b = vld1q_s8_x2(qs + 2*stride);
+    auto p56 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), b[4], q8b.val[0]), b[5], q8b.val[1]);
+    q8b = vld1q_s8_x2(qs + 3*stride);
+    auto p78 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), b[6], q8b.val[0]), b[7], q8b.val[1]);
+    return vpaddq_s32(p1234, vpaddq_s32(p56, p78));
+}
+
 template <int nrc> struct Q80 {
 
     constexpr static int nrc_y = nrc;
+    // block_q8_0 is NOT packed - each block has [d, qs[32]] layout
+    // so we need strided access when processing 4 blocks at a time
+    constexpr static bool needs_strided = true;
+    constexpr static size_t block_stride = sizeof(block_q8_0);
 
     Q80(const DataInfo& info) {
         for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const block_q8_0 *)info.src1_row(iy);
     }
 
+    // Returns pointer to qs of the first block in group of 4
     inline const int8_t * quant_data(int iy, int i) const {
-        const block_q8_0_x4 * y4 = (const block_q8_0_x4 *)y[iy] + i;
-        return y4->qs;
+        return y[iy][4*i].qs;
     }
 
+    // Gather d values from 4 individual blocks into a float16x4_t
     inline float16x4_t load_scales(int iy, int i) const {
-        const block_q8_0_x4 * y4 = (const block_q8_0_x4 *)y[iy] + i;
-        return vld1_f16((const float16_t *)y4->d);
+        ggml_half d_vals[4];
+        for (int k = 0; k < 4; ++k) {
+            d_vals[k] = y[iy][4*i + k].d;
+        }
+        return vld1_f16((const float16_t *)d_vals);
     }
 
     template <typename Dequantizer>
@@ -2599,19 +2666,30 @@ template <int nrc> struct Q80 {
 template <int nrc> struct Q81 {
 
     constexpr static int nrc_y = nrc;
+    // block_q8_1 is NOT packed - each block has [d, s, qs[32]] layout
+    // so we need strided access when processing 4 blocks at a time
+    constexpr static bool needs_strided = true;
+    constexpr static size_t block_stride = sizeof(block_q8_1);
 
     Q81(const DataInfo& info) {
         for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const block_q8_1 *)info.src1_row(iy);
     }
 
+    // Returns pointer to qs of the first block in group of 4
     inline const int8_t * quant_data(int iy, int i) const {
-        const block_q8_1_x4 * y4 = (const block_q8_1_x4 *)y[iy] + i;
-        return y4->qs;
+        return y[iy][4*i].qs;
     }
 
+    // Gather d and s values from 4 individual blocks into a float16x8_t
+    // Layout: [d0, d1, d2, d3, s0, s1, s2, s3]
+    // Must match the qx_scales layout from DequantizerQ*1::new_block()
     inline float16x8_t load_scales(int iy, int i) const {
-        const block_q8_1_x4 * y4 = (const block_q8_1_x4 *)y[iy] + i;
-        return vld1q_f16((const float16_t *)y4->d);
+        ggml_half ds_vals[8];
+        for (int k = 0; k < 4; ++k) {
+            ds_vals[k]     = y[iy][4*i + k].d;
+            ds_vals[4 + k] = y[iy][4*i + k].s;
+        }
+        return vld1q_f16((const float16_t *)ds_vals);
     }
 
     template <typename Dequantizer>
@@ -2791,7 +2869,7 @@ struct DequantizerQ51 final : public BaseLegacyDequantizer<block_q5_1> {
         q[1] = vreinterpretq_s8_u8(vorrq_u8(vreinterpretq_u8_s8(q[1]), vandq_u8(mh, hbits.to_bytes(qh+2))));
     }
     inline void prepare1(int i) {
-        bits.prepare1(x[i].qs, bits.b);
+        prepare1(i, bits.b);
     }
 
     inline float16x8_t new_block(int i) {
@@ -2814,7 +2892,12 @@ struct DequantizerQ51 final : public BaseLegacyDequantizer<block_q5_1> {
 template <typename Dequantizer, typename Q8>
 inline void sum_4(int i, Dequantizer& deq, const Q8& q8, const float16x4_t * sc16, float32x4_t * acc) {
     for (int iy = 0; iy < Q8::nrc_y; ++iy) {
-        auto pall = sum_4_blocks(deq.bits.b, q8.quant_data(iy, i));
+        int32x4_t pall;
+        if constexpr (Q8::needs_strided) {
+            pall = sum_4_blocks_strided(deq.bits.b, q8.quant_data(iy, i), Q8::block_stride);
+        } else {
+            pall = sum_4_blocks(deq.bits.b, q8.quant_data(iy, i));
+        }
         auto scale = vcvt_f32_f16(sc16[iy]);
         acc[iy] = vmlaq_f32(acc[iy], scale, vcvtq_f32_s32(pall));
     }
@@ -2973,7 +3056,6 @@ template <typename Dequantizer> void MulMat::set_functions(MulMat& m) {
 }
 
 bool MulMat::set_mul_mat(int typeA, int ne00, MulMat& m, int& row_size_q8, int Ny) {
-    row_size_q8 = ggml_row_size(GGML_TYPE_Q8_K, ne00);
 
     (void)Ny;
     // Uncommenting out this would disable iqk_mul_mat for matrix x vector multiplications.
@@ -3017,26 +3099,29 @@ bool MulMat::set_mul_mat(int typeA, int ne00, MulMat& m, int& row_size_q8, int N
         case GGML_TYPE_Q4_0:
             MulMat::set_functions<DequantizerQ40>(m);
             row_size_q8 = ggml_row_size(GGML_TYPE_Q8_0, ne00);
-            break;
+            return true;
         case GGML_TYPE_Q4_1:
             MulMat::set_functions<DequantizerQ41>(m);
             row_size_q8 = ggml_row_size(GGML_TYPE_Q8_1, ne00);
-            break;
+            return true;
         case GGML_TYPE_Q5_0:
             MulMat::set_functions<DequantizerQ50>(m);
             row_size_q8 = ggml_row_size(GGML_TYPE_Q8_0, ne00);
-            break;
+            return true;
         case GGML_TYPE_Q5_1:
             MulMat::set_functions<DequantizerQ51>(m);
             row_size_q8 = ggml_row_size(GGML_TYPE_Q8_1, ne00);
-            break;
+            return true;
         case GGML_TYPE_Q8_0:
             MulMat::set_functions<DequantizerQ80>(m);
             row_size_q8 = ggml_row_size(GGML_TYPE_Q8_0, ne00);
-            break;
+            return true;
         default:
             return false;
     }
+
+    // Only K-quant / IQ types reach here (they break out of the switch above)
+    row_size_q8 = ggml_row_size(GGML_TYPE_Q8_K, ne00);
     return true;
 }
 

@@ -1,0 +1,167 @@
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+--- a/llama.cpp/tools/server/server-queue.cpp
++++ b/llama.cpp/tools/server/server-queue.cpp
+@@ -6,6 +6,13 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <thread>
++#include <cerrno>
++#include <system_error>
++#include <csignal>
++
++#ifdef COSMOCC
++#include "llamafile.h"
++#endif
+ 
+ #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+ #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+@@ -123,9 +130,13 @@ void server_queue::wait_until_no_sleep() {
+             condition_tasks.notify_one(); // only main thread is waiting on this
+         }
+         QUE_DBG("%s", "waiting until no sleep\n");
+-        condition_tasks.wait(lock, [&]{
+-            return !sleeping;
+-        });
++        // Use wait_for() instead of wait() to work around a
++        // Cosmopolitan libc bug where untimed futex waits on XNU
++        // (macOS) expire after ~72 minutes, causing
++        // condition_variable::wait() to throw ETIMEDOUT.
++        while (sleeping) {
++            condition_tasks.wait_for(lock, std::chrono::seconds(30));
++        }
+     }
+ }
+ 
+@@ -165,9 +176,13 @@ void server_queue::worker_loop() {
+         {
+             std::unique_lock<std::mutex> lock(mutex_tasks);
+             // wait on busy instead of yielding - busy stays set even when the yield already ended
+-            worker.cv.wait(lock, [&]{
+-                return worker.stop || worker.busy;
+-            });
++            // Use wait_for() instead of wait() to work around a
++            // Cosmopolitan libc bug where untimed futex waits on XNU
++            // (macOS) expire after ~72 minutes, causing
++            // condition_variable::wait() to throw ETIMEDOUT.
++            while (!worker.stop && !worker.busy) {
++                worker.cv.wait_for(lock, std::chrono::seconds(30));
++            }
+             if (worker.stop) {
+                 return;
+             }
+@@ -192,9 +207,13 @@ void server_queue::worker_loop() {
+             if (!queue_tasks.empty()) {
+                 continue; // a new task arrived in the meantime
+             }
+-            condition_tasks.wait(lock, [&]{
+-                return worker.stop || !running || !worker.yielding || !queue_tasks.empty();
+-            });
++            // Use wait_for() instead of wait() to work around a
++            // Cosmopolitan libc bug where untimed futex waits on XNU
++            // (macOS) expire after ~72 minutes, causing
++            // condition_variable::wait() to throw ETIMEDOUT.
++            while (!worker.stop && running && worker.yielding && queue_tasks.empty()) {
++                condition_tasks.wait_for(lock, std::chrono::seconds(30));
++            }
+         }
+ 
+         // signal to yield_to_queue() that no more tasks will be processed
+@@ -220,6 +239,21 @@ void server_queue::worker_stop() {
+ }
+ 
+ void server_queue::yield_to_queue(std::function<void()> && work) {
++#ifdef COSMOCC
++    // Run inline on the calling thread whenever a GPU backend is loaded.
++    // The backends are host ELFs brought in with cosmo_dlopen(), and their
++    // libc reaches thread-local state through %fs. Cosmo gives its own
++    // threads only cosmo TLS (fs_base == gs_base, no glibc TCB), so host libc
++    // called from this worker faults: pthread_getspecific() dereferences a
++    // NULL TCB self-pointer on the very first CUDA decode. The main thread
++    // does have a real host TCB, and it is where decode ran until b10441
++    // introduced this worker. CPU-only runs keep upstream's behaviour; the
++    // cost here is that /slots and /metrics wait for the in-flight batch.
++    if (llamafile_has_gpu()) {
++        work();
++        return;
++    }
++#endif
+     GGML_ASSERT(worker.thread.joinable() && "yield_to_queue() requires start_loop() to be running");
+ 
+     QUE_DBG("%s", "yielding to queue\n");
+@@ -246,9 +280,13 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
+         // the yield is over, wait for the worker to finish its current task
+         worker.yielding = false;
+         condition_tasks.notify_all();
+-        condition_tasks.wait(lock, [&]{
+-            return !worker.busy;
+-        });
++        // Use wait_for() instead of wait() to work around a
++        // Cosmopolitan libc bug where untimed futex waits on XNU
++        // (macOS) expire after ~72 minutes, causing
++        // condition_variable::wait() to throw ETIMEDOUT.
++        while (worker.busy) {
++            condition_tasks.wait_for(lock, std::chrono::seconds(30));
++        }
+ 
+         // put the declined tasks back, keeping their order
+         while (!queue_tasks_unhandled.empty()) {
+@@ -276,6 +314,21 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
+ }
+ 
+ void server_queue::start_loop(int64_t idle_sleep_ms) {
++    // Block every signal on this thread so pthread_cond_timedwait() can't
++    // be interrupted with EINTR (libcxx rethrows EINTR as
++    // std::system_error and std::terminates the process). Keep synchronous
++    // fault signals deliverable so real crashes still surface.
++    sigset_t block_mask;
++    sigfillset(&block_mask);
++    sigdelset(&block_mask, SIGSEGV);
++    sigdelset(&block_mask, SIGBUS);
++    sigdelset(&block_mask, SIGILL);
++    sigdelset(&block_mask, SIGFPE);
++    sigdelset(&block_mask, SIGABRT);
++    sigdelset(&block_mask, SIGSYS);
++    sigdelset(&block_mask, SIGTRAP);
++    pthread_sigmask(SIG_BLOCK, &block_mask, nullptr);
++
+     running = true;
+     time_last_task = ggml_time_ms();
+ 
+@@ -333,9 +386,13 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
+                 }
+                 req_stop_sleeping = false;
+                 // wait until we are requested to exit sleeping state
+-                condition_tasks.wait(lock, [&]{
+-                    return (!running || req_stop_sleeping);
+-                });
++                // Use wait_for() instead of wait() to work around a
++                // Cosmopolitan libc bug where untimed futex waits on
++                // XNU (macOS) expire after ~72 minutes, causing
++                // condition_variable::wait() to throw ETIMEDOUT.
++                while (running && !req_stop_sleeping) {
++                    condition_tasks.wait_for(lock, std::chrono::seconds(30));
++                }
+                 if (!running) { // may changed during sleep
+                     break; // terminate
+                 }
+@@ -427,13 +484,17 @@ void server_response::remove_waiting_task_ids(const std::unordered_set<int> & id
+ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_tasks) {
+     while (true) {
+         std::unique_lock<std::mutex> lock(mutex_results);
+-        condition_results.wait(lock, [&]{
++        // Use wait_for() instead of wait() to work around a
++        // Cosmopolitan libc bug where untimed futex waits on XNU
++        // (macOS) expire after ~72 minutes, causing
++        // condition_variable::wait() to throw ETIMEDOUT.
++        while (queue_results.empty()) {
++            condition_results.wait_for(lock, std::chrono::seconds(30));
+             if (!running) {
+                 RES_DBG("%s : queue result stop\n", "recv");
+                 std::terminate(); // we cannot return here since the caller is HTTP code
+             }
+-            return !queue_results.empty();
+-        });
++        }
+ 
+         for (size_t i = 0; i < queue_results.size(); i++) {
+             if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {

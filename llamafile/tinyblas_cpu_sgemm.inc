@@ -95,8 +95,18 @@ bool llamafile_sgemm_impl(long m, long n, long k, const void *A, long lda, const
             return true;
         }
 #elif defined(__AVX512F__)
-        tinyBLAS<0, 16, __m512, __m512, ggml_bf16_t, float, TC> tb{
-            k, (const ggml_bf16_t *)A, lda, (const float *)B, ldb, C, ldc, ith, nth};
+        if (Btype == GGML_TYPE_F32) {
+            tinyBLAS<0, 16, __m512, __m512, ggml_bf16_t, float, TC> tb{
+                k, (const ggml_bf16_t *)A, lda, (const float *)B, ldb, C, ldc, ith, nth};
+            tb.matmul(m, n);
+            return true;
+        }
+        // ggml-cpu may hand us B converted to the bf16 vec_dot_type (e.g. when
+        // src1 is not contiguous); reading that buffer as f32 yields garbage.
+        if (Btype != GGML_TYPE_BF16)
+            return NOT_SUPPORTED;
+        tinyBLAS<0, 16, __m512, __m512, ggml_bf16_t, ggml_bf16_t, TC> tb{
+            k, (const ggml_bf16_t *)A, lda, (const ggml_bf16_t *)B, ldb, C, ldc, ith, nth};
         tb.matmul(m, n);
         return true;
 #elif defined(__AVX2__)
@@ -220,6 +230,27 @@ bool llamafile_sgemm_impl(long m, long n, long k, const void *A, long lda, const
 #endif
     }
 
+    case GGML_TYPE_Q1_0: {
+        // Upstream Q1_0 uses 128-element blocks (QK1_0=128)
+        if (Btype == GGML_TYPE_F32)
+            return WANT_QUANTIZATION;
+        if (Btype != GGML_TYPE_Q8_0)
+            return NOT_SUPPORTED;
+#if defined(__AVX2__) || defined(__AVX512F__)
+        tinyBLAS_Q0_g128_AVX2<0, TC> tb{
+            k, (const block_q1_0 *)A, lda, (const block_q8_0 *)B, ldb, C, ldc, ith, nth};
+        tb.matmul(m, n);
+        return true;
+#elif defined(__ARM_FEATURE_DOTPROD)
+        tinyBLAS_Q0_g128_ARM<0, TC> tb{
+            k, (const block_q1_0 *)A, lda, (const block_q8_0 *)B, ldb, C, ldc, ith, nth};
+        tb.matmul(m, n);
+        return true;
+#else
+        return NOT_SUPPORTED;
+#endif
+    }
+
     default:
         return NOT_SUPPORTED;
     }
@@ -283,8 +314,15 @@ bool llamafile_sgemm(long m, long n, long k, const void *A, long lda, const void
     assert(nth > 0);
     assert(ith < nth);
 
+    // iqk_mul_mat has no lda/ldb parameters and assumes densely packed rows.
+    // Permuted or viewed tensors (e.g. ggml_permute'd src0) arrive with a
+    // larger row stride, so route those to the stride-aware kernels below
+    // or back to vanilla ggml.
+    const bool dense_rows = (lda == k && ldb == k);
+    (void)dense_rows;  // unused on ISAs without an iqk_mul_mat shortcut
+
 #if defined(__x86_64__)
-    if (X86_CHECK(AVX2) && X86_CHECK(FMA)) {
+    if (dense_rows && X86_CHECK(AVX2) && X86_CHECK(FMA)) {
         if (Btype == GGML_TYPE_Q8_K && Ctype == GGML_TYPE_F32) {
             if (iqk_mul_mat(m, n, k * QK_K, Atype, A, B, (float *)C, ldc, ith, nth)) {
                 return true;
@@ -303,12 +341,12 @@ bool llamafile_sgemm(long m, long n, long k, const void *A, long lda, const void
         }
     }
 #elif defined __aarch64__ && defined __ARM_FEATURE_DOTPROD && !defined _MSC_VER
-    if (Btype == GGML_TYPE_Q8_K && Ctype == GGML_TYPE_F32) {
+    if (dense_rows && Btype == GGML_TYPE_Q8_K && Ctype == GGML_TYPE_F32) {
         if (iqk_mul_mat(m, n, k * QK_K, Atype, A, B, (float *)C, ldc, ith, nth)) {
             return true;
         }
     }
-    if ((Btype == GGML_TYPE_Q8_0 || Btype == GGML_TYPE_Q8_1) && Ctype == GGML_TYPE_F32) {
+    if (dense_rows && (Btype == GGML_TYPE_Q8_0 || Btype == GGML_TYPE_Q8_1) && Ctype == GGML_TYPE_F32) {
         assert(QK8_0 == 32 && //
                QK8_1 == 32 && //
                QK4_0 == 32 && //

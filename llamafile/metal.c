@@ -1,7 +1,8 @@
 // -*- mode:c;indent-tabs-mode:nil;c-basic-offset:4;coding:utf-8 -*-
 // vi: set et ft=c ts=4 sts=4 sw=4 fenc=utf-8 :vi
 //
-// Copyright 2023 Mozilla Foundation
+// Copyright 2024 Mozilla Foundation
+// Copyright 2026 Mozilla.ai
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +16,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "llama.cpp/ggml-metal.h"
+//
+// Runtime Metal GPU support for llamafile
+//
+// This file implements dynamic compilation and loading of Metal GPU support.
+// At runtime on macOS ARM64:
+//   1. Extract Metal source files from /zip/ to ~/.llamafile/
+//   2. Compile everything into a self-contained dylib using system cc
+//   3. Load the dylib with cosmo_dlopen() and register the Metal backend
+//
+// The shader sources (kernels/*.metal) are compiled by the Metal runtime
+// itself, not by us: the backend is built without GGML_METAL_EMBED_LIBRARY,
+// so ggml_metal_library_init() reads kernels/<kind>.metal, flattens their
+// #includes and hands the result to newLibraryWithSource. It looks them up
+// under $GGML_METAL_PATH_RESOURCES, which we point at the app dir.
+//
+// The dylib is self-contained (includes ggml core) because cosmo_dlopen()
+// cannot resolve symbols from the parent process.
+//
+
+#define _COSMO_SOURCE  // exposes cosmo extensions like makedirs()
+
 #include "llamafile.h"
-#include "log.h"
-#include <assert.h>
 #include <cosmo.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -26,92 +45,236 @@
 #include <pthread.h>
 #include <spawn.h>
 #include <stdatomic.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
 
-__static_yoink("llama.cpp/ggml.h");
-__static_yoink("llamafile/llamafile.h");
-__static_yoink("llama.cpp/ggml-impl.h");
-__static_yoink("llama.cpp/ggml-alloc.h");
-__static_yoink("llama.cpp/ggml-metal.m");
-__static_yoink("llama.cpp/ggml-metal.h");
-__static_yoink("llama.cpp/ggml-common.h");
-__static_yoink("llama.cpp/ggml-quants.h");
-__static_yoink("llama.cpp/ggml-backend.h");
-__static_yoink("llama.cpp/ggml-metal.metal");
-__static_yoink("llama.cpp/ggml-backend-impl.h");
+// Declare environ for posix_spawn
+extern char **environ;
 
-static const struct Source {
+// Embed all Metal source files into the executable
+// Core ggml (for self-contained dylib)
+__static_yoink("llama.cpp/ggml/src/ggml.c");
+__static_yoink("llama.cpp/ggml/src/ggml-alloc.c");
+__static_yoink("llama.cpp/ggml/src/ggml-backend.cpp");
+__static_yoink("llama.cpp/ggml/src/ggml-backend-meta.cpp");
+__static_yoink("llama.cpp/ggml/src/ggml-quants.c");
+__static_yoink("llama.cpp/ggml/src/ggml-threading.cpp");
+
+// Headers
+__static_yoink("llama.cpp/ggml/include/ggml.h");
+__static_yoink("llama.cpp/ggml/include/gguf.h");
+__static_yoink("llama.cpp/ggml/include/ggml-cpu.h");
+__static_yoink("llama.cpp/ggml/include/ggml-alloc.h");
+__static_yoink("llama.cpp/ggml/include/ggml-backend.h");
+__static_yoink("llama.cpp/ggml/include/ggml-cpp.h");
+__static_yoink("llama.cpp/ggml/include/ggml-metal.h");
+__static_yoink("llama.cpp/ggml/src/ggml-impl.h");
+__static_yoink("llama.cpp/ggml/src/ggml-version.h");
+__static_yoink("llama.cpp/ggml/src/ggml-common.h");
+__static_yoink("llama.cpp/ggml/src/ggml-quants.h");
+__static_yoink("llama.cpp/ggml/src/ggml-threading.h");
+__static_yoink("llama.cpp/ggml/src/ggml-backend-impl.h");
+__static_yoink("llama.cpp/ggml/src/ggml-cpu/ggml-cpu-impl.h");
+
+// Metal backend
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal.cpp");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-device.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-device.cpp");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-context.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-common.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-common.cpp");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-fusion.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-fusion.cpp");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-tuning.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/ggml-metal-tuning.cpp");
+
+// Metal shader sources, compiled by the Metal runtime at first use. Since
+// b11100 upstream ships one .metal per op family under kernels/ instead of a
+// single ggml-metal.metal.
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/common.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/dequantize.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/quantize.h");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/argsort.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/binbcast.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/conv.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/fa.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/gated_delta_net.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/misc.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/mul_mm.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/mul_mv.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/norm.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/pool.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/quantize.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/reduce.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/rope.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/softmax.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/solve_tri.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/ssm.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/tri.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/unary.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/upscale.metal");
+__static_yoink("llama.cpp/ggml/src/ggml-metal/kernels/wkv.metal");
+
+// Sources to extract at runtime
+static const struct MetalSource {
     const char *zip;
     const char *name;
-} srcs[] = {
-    {"/zip/llama.cpp/ggml.h", "ggml.h"},
-    {"/zip/llamafile/llamafile.h", "llamafile.h"},
-    {"/zip/llama.cpp/ggml-impl.h", "ggml-impl.h"},
-    {"/zip/llama.cpp/ggml-metal.h", "ggml-metal.h"},
-    {"/zip/llama.cpp/ggml-alloc.h", "ggml-alloc.h"},
-    {"/zip/llama.cpp/ggml-common.h", "ggml-common.h"},
-    {"/zip/llama.cpp/ggml-quants.h", "ggml-quants.h"},
-    {"/zip/llama.cpp/ggml-backend.h", "ggml-backend.h"},
-    {"/zip/llama.cpp/ggml-metal.metal", "ggml-metal.metal"},
-    {"/zip/llama.cpp/ggml-backend-impl.h", "ggml-backend-impl.h"},
-    {"/zip/llama.cpp/ggml-metal.m", "ggml-metal.m"}, // must come last
+} metal_srcs[] = {
+    // Core ggml headers
+    {"/zip/llama.cpp/ggml/include/ggml.h", "ggml.h"},
+    {"/zip/llama.cpp/ggml/include/gguf.h", "gguf.h"},
+    {"/zip/llama.cpp/ggml/include/ggml-cpu.h", "ggml-cpu.h"},
+    {"/zip/llama.cpp/ggml/include/ggml-alloc.h", "ggml-alloc.h"},
+    {"/zip/llama.cpp/ggml/include/ggml-backend.h", "ggml-backend.h"},
+    {"/zip/llama.cpp/ggml/include/ggml-cpp.h", "ggml-cpp.h"},
+    {"/zip/llama.cpp/ggml/include/ggml-metal.h", "ggml-metal.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-impl.h", "ggml-impl.h"},
+    // generated by llama.cpp.patches/apply-patches.sh; ggml.c includes it
+    {"/zip/llama.cpp/ggml/src/ggml-version.h", "ggml-version.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-common.h", "ggml-common.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-quants.h", "ggml-quants.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-threading.h", "ggml-threading.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-backend-impl.h", "ggml-backend-impl.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-cpu/ggml-cpu-impl.h", "ggml-cpu/ggml-cpu-impl.h"},
+
+    // Core ggml implementation - needed for self-contained dylib
+    {"/zip/llama.cpp/ggml/src/ggml.c", "ggml.c"},
+    {"/zip/llama.cpp/ggml/src/ggml-alloc.c", "ggml-alloc.c"},
+    {"/zip/llama.cpp/ggml/src/ggml-backend.cpp", "ggml-backend.cpp"},
+    {"/zip/llama.cpp/ggml/src/ggml-backend-meta.cpp", "ggml-backend-meta.cpp"},
+    {"/zip/llama.cpp/ggml/src/ggml-quants.c", "ggml-quants.c"},
+    {"/zip/llama.cpp/ggml/src/ggml-threading.cpp", "ggml-threading.cpp"},
+
+    // Metal-specific files
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal.cpp", "ggml-metal.cpp"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h", "ggml-metal-impl.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.h", "ggml-metal-device.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m", "ggml-metal-device.m"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.cpp", "ggml-metal-device.cpp"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.h", "ggml-metal-context.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m", "ggml-metal-context.m"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-common.h", "ggml-metal-common.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-common.cpp", "ggml-metal-common.cpp"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.h", "ggml-metal-ops.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp", "ggml-metal-ops.cpp"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-fusion.h", "ggml-metal-fusion.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-fusion.cpp", "ggml-metal-fusion.cpp"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-tuning.h", "ggml-metal-tuning.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/ggml-metal-tuning.cpp", "ggml-metal-tuning.cpp"},
+
+    // Shader sources. ggml_metal_library_flatten_source() resolves the quoted
+    // includes in these against kernels/ and its parent, so ggml-common.h and
+    // ggml-metal-impl.h above are reachable from them once extracted.
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/common.h", "kernels/common.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/dequantize.h", "kernels/dequantize.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/quantize.h", "kernels/quantize.h"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/argsort.metal", "kernels/argsort.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/binbcast.metal", "kernels/binbcast.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/conv.metal", "kernels/conv.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/fa.metal", "kernels/fa.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/gated_delta_net.metal", "kernels/gated_delta_net.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/misc.metal", "kernels/misc.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/mul_mm.metal", "kernels/mul_mm.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/mul_mv.metal", "kernels/mul_mv.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/norm.metal", "kernels/norm.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/pool.metal", "kernels/pool.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/quantize.metal", "kernels/quantize.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/reduce.metal", "kernels/reduce.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/rope.metal", "kernels/rope.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/softmax.metal", "kernels/softmax.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/solve_tri.metal", "kernels/solve_tri.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/ssm.metal", "kernels/ssm.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/tri.metal", "kernels/tri.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/unary.metal", "kernels/unary.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/upscale.metal", "kernels/upscale.metal"},
+    {"/zip/llama.cpp/ggml/src/ggml-metal/kernels/wkv.metal", "kernels/wkv.metal"},
 };
 
-ggml_backend_t ggml_backend_reg_metal_init(const char *, void *);
+// Forward declarations for ggml backend types
+typedef struct ggml_backend * ggml_backend_t;
+typedef struct ggml_backend_reg * ggml_backend_reg_t;
 
-static struct Metal {
+// Function to register a backend with ggml (from ggml-backend.h)
+extern void ggml_backend_register(ggml_backend_reg_t reg);
+
+// Log callback type (must match ggml_log_callback from ggml.h)
+typedef void (*llamafile_log_callback)(int level, const char *text, void *user_data);
+
+// Pending log callback (set before dylib loads, applied during init)
+static struct {
+    llamafile_log_callback callback;
+    void *user_data;
+    bool is_set;
+} g_metal_pending_log;
+
+// Function pointers for dynamically loaded Metal backend
+static struct MetalBackend {
     bool supported;
     atomic_uint once;
-    typeof(ggml_metal_link) *ggml_metal_link;
-    typeof(ggml_backend_metal_init) *backend_init;
-    typeof(ggml_backend_metal_buffer_type) *GGML_CALL backend_buffer_type;
-    typeof(ggml_backend_metal_buffer_from_ptr) *GGML_CALL backend_buffer_from_ptr;
-    typeof(ggml_backend_is_metal) *backend_is_metal;
-    typeof(ggml_backend_metal_set_n_cb) *backend_set_n_cb;
-    typeof(ggml_backend_metal_log_set_callback) *log_set_callback;
-    typeof(ggml_backend_reg_metal_init) *reg_init;
-    typeof(ggml_backend_metal_get_device_properties) *get_device_properties;
-    typeof(ggml_backend_metal_get_device_memory_usage) *get_device_memory_usage;
-    typeof(ggml_backend_metal_supports_family) *supports_family;
-} ggml_metal;
+    void *lib_handle;
 
-static const char *Dlerror(void) {
-    const char *msg;
-    msg = cosmo_dlerror();
-    if (!msg)
-        msg = "null dlopen error";
-    return msg;
-}
+    // Function pointers matching ggml-metal.h
+    ggml_backend_t (*backend_init)(void);
+    bool (*backend_is_metal)(ggml_backend_t backend);
+    ggml_backend_reg_t (*backend_metal_reg)(void);
 
-static bool FileExists(const char *path) {
-    struct stat st;
-    return !stat(path, &st);
-}
+    // Logging control
+    void (*log_set)(llamafile_log_callback log_callback, void *user_data);
+} g_metal;
 
 static bool BuildMetal(const char *dso) {
-
-    // extract source code
+    char app_dir[PATH_MAX];
     char src[PATH_MAX];
     bool needs_rebuild = false;
-    for (int i = 0; i < sizeof(srcs) / sizeof(*srcs); ++i) {
-        llamafile_get_app_dir(src, PATH_MAX);
-        if (!i && makedirs(src, 0755)) {
-            perror(src);
-            return false;
+
+    llamafile_get_app_dir(app_dir, PATH_MAX);
+
+    // Check if dylib already exists for this version
+    // Since we use versioned paths, source updates come with new versions
+    struct stat dso_stat;
+    if (stat(dso, &dso_stat) == 0 && !FLAG_recompile) {
+        llamafile_info("metal", "using cached %s", dso);
+        return true;
+    }
+
+    // Create app directory
+    if (makedirs(app_dir, 0755) != 0) {
+        perror(app_dir);
+        return false;
+    }
+
+    // Extract all source files
+    for (size_t i = 0; i < sizeof(metal_srcs) / sizeof(*metal_srcs); ++i) {
+        snprintf(src, PATH_MAX, "%s%s", app_dir, metal_srcs[i].name);
+
+        // Create parent directories if needed
+        char *last_slash = strrchr(src, '/');
+        if (last_slash && last_slash != src) {
+            char parent_dir[PATH_MAX];
+            size_t parent_len = last_slash - src;
+            memcpy(parent_dir, src, parent_len);
+            parent_dir[parent_len] = '\0';
+            makedirs(parent_dir, 0755);
         }
-        strlcat(src, srcs[i].name, sizeof(src));
-        switch (llamafile_is_file_newer_than(srcs[i].zip, src)) {
+
+        switch (llamafile_is_file_newer_than(metal_srcs[i].zip, src)) {
         case -1:
             return false;
         case 0:
             break;
         case 1:
             needs_rebuild = true;
-            if (!llamafile_extract(srcs[i].zip, src)) {
+            if (!llamafile_extract(metal_srcs[i].zip, src)) {
                 return false;
             }
             break;
@@ -120,7 +283,8 @@ static bool BuildMetal(const char *dso) {
         }
     }
 
-    // determine if we need to build
+    // Check if dylib needs rebuild
+    snprintf(src, PATH_MAX, "%sggml-metal.cpp", app_dir);
     if (!needs_rebuild) {
         switch (llamafile_is_file_newer_than(src, dso)) {
         case -1:
@@ -135,112 +299,240 @@ static bool BuildMetal(const char *dso) {
         }
     }
 
-    // compile dynamic shared object
+    // Compile dynamic shared object
     if (needs_rebuild || FLAG_recompile) {
-        tinylog("building ggml-metal.dylib with xcode...\n", NULL);
-        int fd;
+        llamafile_info("metal", "building ggml-metal.dylib with xcode...");
+
         char tmpdso[PATH_MAX];
-        strlcpy(tmpdso, dso, sizeof(tmpdso));
-        strlcat(tmpdso, ".XXXXXX", sizeof(tmpdso));
-        if ((fd = mkostemp(tmpdso, O_CLOEXEC)) != -1) {
-            close(fd);
-        } else {
+        snprintf(tmpdso, PATH_MAX, "%s.XXXXXX", dso);
+        int fd = mkstemp(tmpdso);
+        if (fd == -1) {
             perror(tmpdso);
             return false;
         }
-        char *args[] = {
-            "cc",
-            "-I.",
-            "-O3",
-            "-fPIC",
-            "-shared",
-            "-pthread",
-            "-DNDEBUG",
-            "-ffixed-x28", // cosmo's tls register
-            "-DTARGET_OS_OSX",
-            "-DGGML_MULTIPLATFORM",
-            src,
-            "-o",
-            tmpdso,
-            "-framework",
-            "Foundation",
-            "-framework",
-            "Metal",
-            "-framework",
-            "MetalKit",
-            NULL,
+        close(fd);
+
+        // Build include path
+        char include_arg[PATH_MAX + 2];
+        snprintf(include_arg, sizeof(include_arg), "-I%s", app_dir);
+
+        // Source files to compile
+#define MAX_METAL_SRCS 16
+        static const char *src_basenames[] = {
+            "ggml.c",
+            "ggml-alloc.c",
+            "ggml-quants.c",
+            "ggml-backend.cpp",
+            "ggml-backend-meta.cpp",
+            "ggml-threading.cpp",
+            "ggml-metal.cpp",
+            "ggml-metal-device.cpp",
+            "ggml-metal-common.cpp",
+            "ggml-metal-ops.cpp",
+            "ggml-metal-fusion.cpp",
+            "ggml-metal-tuning.cpp",
+            "ggml-metal-device.m",
+            "ggml-metal-context.m",
+            NULL
         };
-        int pid, ws;
-        llamafile_log_command(args);
-        errno_t err = posix_spawnp(&pid, "cc", NULL, NULL, args, environ);
-        if (err) {
-            perror("cc");
-            if (err == ENOENT) {
-                tinylog("PLEASE RUN: xcode-select --install\n", NULL);
+        _Static_assert(sizeof(src_basenames)/sizeof(src_basenames[0]) - 1 <= MAX_METAL_SRCS,
+                       "Too many Metal source files, update MAX_METAL_SRCS in llamafile/metal.c");
+
+        // Count source files and prepare object paths
+        int num_srcs = 0;
+        while (src_basenames[num_srcs]) num_srcs++;
+
+        char obj_paths[MAX_METAL_SRCS][PATH_MAX];
+
+        // Compile each source file
+        bool compile_error = false;
+        int i;
+        for (i = 0; i < num_srcs; i++) {
+            char src_path[PATH_MAX];
+            snprintf(src_path, PATH_MAX, "%s%s", app_dir, src_basenames[i]);
+            snprintf(obj_paths[i], PATH_MAX, "%s%s.o", app_dir, src_basenames[i]);
+
+            // Check if file is C++ (.cpp extension)
+            const char *ext = strrchr(src_basenames[i], '.');
+            bool is_cpp = ext && strcmp(ext, ".cpp") == 0;
+
+            char *args[32];
+            int argc = 0;
+            args[argc++] = "cc";
+            args[argc++] = "-c";
+            args[argc++] = include_arg;
+            if (is_cpp)
+                args[argc++] = "-std=c++17";
+            args[argc++] = "-O3";
+            args[argc++] = "-fPIC";
+            args[argc++] = "-pthread";
+            args[argc++] = "-DNDEBUG";
+            args[argc++] = "-ffixed-x28";  // cosmo's TLS register
+            args[argc++] = "-DTARGET_OS_OSX";
+            args[argc++] = "-DGGML_MULTIPLATFORM";
+            args[argc++] = "-w";  // Suppress compilation warnings
+            args[argc++] = "-o";
+            args[argc++] = obj_paths[i];
+            args[argc++] = src_path;
+            args[argc] = NULL;
+
+            if (FLAG_verbose) {
+                char cmd[4096];
+                size_t off = 0;
+                off += snprintf(cmd + off, sizeof(cmd) - off, "executing: cc");
+                for (int j = 1; args[j] && off < sizeof(cmd); j++)
+                    off += snprintf(cmd + off, sizeof(cmd) - off, " %s", args[j]);
+                llamafile_info("metal", "%s", cmd);
             }
+
+            int pid, ws;
+            errno_t err = posix_spawnp(&pid, "cc", NULL, NULL, args, environ);
+            if (err) {
+                perror("cc");
+                if (err == ENOENT) {
+                    fprintf(stderr, "metal: PLEASE RUN: xcode-select --install\n");
+                }
+                compile_error = true;
+                break;
+            }
+
+            while (waitpid(pid, &ws, 0) == -1) {
+                if (errno != EINTR) {
+                    perror("waitpid");
+                    compile_error = true;
+                    break;
+                }
+            }
+            if (compile_error)
+                break;
+
+            if (ws) {
+                fprintf(stderr, "metal: failed to compile %s\n", src_basenames[i]);
+                compile_error = true;
+                break;
+            }
+        }
+
+        if (compile_error) {
+            for (int j = 0; j <= i; j++)
+                unlink(obj_paths[j]);
+            unlink(tmpdso);
             return false;
         }
-        while (waitpid(pid, &ws, 0) == -1) {
-            if (errno != EINTR) {
+
+        // Link all object files into shared library
+        {
+            char *args[64];
+            int argc = 0;
+            args[argc++] = "cc";
+            args[argc++] = "-shared";
+            args[argc++] = "-fPIC";
+            args[argc++] = "-pthread";
+            args[argc++] = "-ffixed-x28";
+            args[argc++] = "-o";
+            args[argc++] = tmpdso;
+            for (int i = 0; i < num_srcs; i++)
+                args[argc++] = obj_paths[i];
+            args[argc++] = "-framework";
+            args[argc++] = "Foundation";
+            args[argc++] = "-framework";
+            args[argc++] = "Metal";
+            args[argc++] = "-framework";
+            args[argc++] = "MetalKit";
+            args[argc++] = "-lc++";
+            args[argc] = NULL;
+
+            if (FLAG_verbose) {
+                char cmd[4096];
+                size_t off = 0;
+                off += snprintf(cmd + off, sizeof(cmd) - off, "executing: cc");
+                for (int j = 1; args[j] && off < sizeof(cmd); j++)
+                    off += snprintf(cmd + off, sizeof(cmd) - off, " %s", args[j]);
+                llamafile_info("metal", "%s", cmd);
+            }
+
+            int pid, ws;
+            errno_t err = posix_spawnp(&pid, "cc", NULL, NULL, args, environ);
+            if (err) {
                 perror("cc");
+                unlink(tmpdso);
+                return false;
+            }
+
+            while (waitpid(pid, &ws, 0) == -1) {
+                if (errno != EINTR) {
+                    perror("waitpid");
+                    unlink(tmpdso);
+                    return false;
+                }
+            }
+
+            if (ws) {
+                fprintf(stderr, "metal: linker returned nonzero exit status\n");
+                unlink(tmpdso);
                 return false;
             }
         }
-        if (ws) {
-            tinylog("compiler returned nonzero exit status\n", NULL);
-            return false;
-        }
+
+        // Clean up object files
+        for (int i = 0; i < num_srcs; i++)
+            unlink(obj_paths[i]);
+
         if (rename(tmpdso, dso)) {
             perror(dso);
+            unlink(tmpdso);
             return false;
         }
+
+        llamafile_info("metal", "successfully built %s", dso);
     }
 
     return true;
 }
 
 static bool LinkMetal(const char *dso) {
-
-    // runtime link dynamic shared object
-    void *lib;
-    lib = cosmo_dlopen(dso, RTLD_LAZY);
+    // Load dynamic shared object using Cosmopolitan's dlopen
+    void *lib = cosmo_dlopen(dso, RTLD_LAZY);
     if (!lib) {
-        tinylog(Dlerror(), ": failed to load library\n", NULL);
+        char *err = cosmo_dlerror();
+        llamafile_info("metal", "failed to load library %s: %s",
+                       dso, err ? err : "unknown error");
         return false;
     }
 
-    // import functions
+    // Import functions
     bool ok = true;
-    ok &= !!(ggml_metal.ggml_metal_link = cosmo_dlsym(lib, "ggml_metal_link"));
-    ok &= !!(ggml_metal.backend_init = cosmo_dlsym(lib, "ggml_backend_metal_init"));
-    ok &= !!(ggml_metal.backend_buffer_type = cosmo_dlsym(lib, "ggml_backend_metal_buffer_type"));
-    ok &= !!(ggml_metal.backend_buffer_from_ptr =
-                 cosmo_dlsym(lib, "ggml_backend_metal_buffer_from_ptr"));
-    ok &= !!(ggml_metal.backend_is_metal = cosmo_dlsym(lib, "ggml_backend_is_metal"));
-    ok &= !!(ggml_metal.backend_set_n_cb = cosmo_dlsym(lib, "ggml_backend_metal_set_n_cb"));
-    ok &= !!(ggml_metal.log_set_callback = cosmo_dlsym(lib, "ggml_backend_metal_log_set_callback"));
-    ok &= !!(ggml_metal.reg_init = cosmo_dlsym(lib, "ggml_backend_reg_metal_init"));
-    ok &= !!(ggml_metal.get_device_properties = cosmo_dlsym(lib, "ggml_backend_metal_get_device_properties"));
-    ok &= !!(ggml_metal.get_device_memory_usage = cosmo_dlsym(lib, "ggml_backend_metal_get_device_memory_usage"));
-    ok &= !!(ggml_metal.supports_family = cosmo_dlsym(lib, "ggml_backend_metal_supports_family"));
+    *(void **)(&g_metal.backend_init) = cosmo_dlsym(lib, "ggml_backend_metal_init");
+    ok &= (g_metal.backend_init != NULL);
+
+    *(void **)(&g_metal.backend_is_metal) = cosmo_dlsym(lib, "ggml_backend_is_metal");
+    ok &= (g_metal.backend_is_metal != NULL);
+
+    *(void **)(&g_metal.backend_metal_reg) = cosmo_dlsym(lib, "ggml_backend_metal_reg");
+    ok &= (g_metal.backend_metal_reg != NULL);
+
+    // Import logging control (optional - don't fail if not found)
+    *(void **)(&g_metal.log_set) = cosmo_dlsym(lib, "ggml_log_set");
+
     if (!ok) {
-        tinylog(Dlerror(), ": not all symbols could be imported\n", NULL);
+        char *err = cosmo_dlerror();
+        llamafile_info("metal", "could not import all symbols from %s: %s",
+                       dso, err ? err : "unknown error");
+        cosmo_dlclose(lib);
         return false;
     }
 
-    // we're good
-    ggml_metal.ggml_metal_link(ggml_backend_api());
+    g_metal.lib_handle = lib;
     return true;
 }
 
 static bool ImportMetalImpl(void) {
-
-    // Ensure this is MacOS ARM64.
+    // Ensure this is macOS ARM64
     if (!IsXnuSilicon()) {
         return false;
     }
 
-    // Check if we're allowed to even try.
+    // Check if we're allowed to even try
     switch (FLAG_gpu) {
     case LLAMAFILE_GPU_AUTO:
     case LLAMAFILE_GPU_APPLE:
@@ -249,98 +541,93 @@ static bool ImportMetalImpl(void) {
         return false;
     }
 
-    npassert(FLAGS_READY);
-
-    // Get path of DSO.
+    // Get path of DSO
     char dso[PATH_MAX];
-    llamafile_get_app_dir(dso, PATH_MAX);
-    strlcat(dso, "ggml-metal.dylib", sizeof(dso));
+    char app_dir[PATH_MAX];
+    llamafile_get_app_dir(app_dir, PATH_MAX);
+    snprintf(dso, PATH_MAX, "%sggml-metal.dylib", app_dir);
+
+    // The dylib is built without GGML_METAL_EMBED_LIBRARY, so
+    // ggml_metal_library_init() compiles kernels/<kind>.metal at first use.
+    // It finds them through [NSBundle bundleForClass:], which for a loose
+    // dylib resolves to the dylib's own directory, i.e. app_dir, where
+    // BuildMetal() extracts them. GGML_METAL_PATH_RESOURCES takes precedence
+    // over that lookup, and it can't be overridden from here: setenv() only
+    // changes Cosmopolitan's environ, which libSystem inside the dylib never
+    // reads. So if it is set, kernels come from elsewhere; say so.
+    const char *res_path = getenv("GGML_METAL_PATH_RESOURCES");
+    if (res_path && *res_path) {
+        fprintf(stderr,
+                "metal: warning: GGML_METAL_PATH_RESOURCES=%s overrides the kernels "
+                "extracted to %s; unset it unless those kernels match this llamafile\n",
+                res_path, app_dir);
+    }
+
     if (FLAG_nocompile) {
         return LinkMetal(dso);
     }
 
-    // Build and link Metal support DSO if possible.
+    // Build and link Metal support DSO if possible
     if (BuildMetal(dso)) {
-        return LinkMetal(dso);
-    } else {
-        return false;
+        if (LinkMetal(dso)) {
+            // Apply pending log callback before registration triggers GPU init
+            if (g_metal_pending_log.is_set && g_metal.log_set) {
+                g_metal.log_set(g_metal_pending_log.callback, g_metal_pending_log.user_data);
+            }
+
+            // Register the Metal backend with GGML
+            if (g_metal.backend_metal_reg) {
+                ggml_backend_reg_t reg = g_metal.backend_metal_reg();
+                if (reg) {
+                    ggml_backend_register(reg);
+                    llamafile_info("metal", "Metal backend registered with GGML");
+                }
+            }
+            return true;
+        }
     }
+    return false;
 }
 
 static void ImportMetal(void) {
     if (ImportMetalImpl()) {
-        ggml_metal.supported = true;
-        tinylog("Apple Metal GPU support successfully loaded\n", NULL);
+        g_metal.supported = true;
+        llamafile_info("metal", "Apple Metal GPU support successfully loaded");
     } else if (FLAG_gpu == LLAMAFILE_GPU_APPLE) {
-        tinyprint(2, "fatal error: support for --gpu ", llamafile_describe_gpu(),
-                  FLAG_tinyblas ? " --tinyblas" : "",
-                  " was explicitly requested, but it wasn't available\n", NULL);
+        fprintf(stderr, "fatal error: support for --gpu %s was explicitly requested, "
+                "but it wasn't available\n", llamafile_describe_gpu());
         exit(1);
     }
 }
 
 bool llamafile_has_metal(void) {
-    cosmo_once(&ggml_metal.once, ImportMetal);
-    return ggml_metal.supported;
+    cosmo_once(&g_metal.once, ImportMetal);
+    return g_metal.supported;
 }
+
+// Wrapper functions that forward to dynamically loaded Metal backend
 
 ggml_backend_t ggml_backend_metal_init(void) {
     if (!llamafile_has_metal())
-        return 0;
-    return ggml_metal.backend_init();
-}
-
-GGML_CALL ggml_backend_buffer_type_t ggml_backend_metal_buffer_type(void) {
-    if (!llamafile_has_metal())
-        return 0;
-    return ggml_metal.backend_buffer_type();
-}
-
-GGML_CALL ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr(void *data, size_t size,
-                                                                   size_t max_size) {
-    if (!llamafile_has_metal())
-        return 0;
-    return ggml_metal.backend_buffer_from_ptr(data, size, max_size);
+        return NULL;
+    return g_metal.backend_init();
 }
 
 bool ggml_backend_is_metal(ggml_backend_t backend) {
     if (!llamafile_has_metal())
-        return 0;
-    return ggml_metal.backend_is_metal(backend);
+        return false;
+    return g_metal.backend_is_metal(backend);
 }
 
-void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
-    if (!llamafile_has_metal())
-        return;
-    return ggml_metal.backend_set_n_cb(backend, n_cb);
-}
+void llamafile_metal_log_set(llamafile_log_callback log_callback, void *user_data) {
+    // Store as pending callback - will be applied when dylib loads
+    // This must be set BEFORE llamafile_has_metal() is called
+    g_metal_pending_log.callback = log_callback;
+    g_metal_pending_log.user_data = user_data;
+    g_metal_pending_log.is_set = true;
 
-void ggml_backend_metal_log_set_callback(ggml_log_callback log_callback, void *user_data) {
-    if (!llamafile_has_metal())
-        return;
-    return ggml_metal.log_set_callback(log_callback, user_data);
-}
-
-ggml_backend_t ggml_backend_reg_metal_init(const char *params, void *user_data) {
-    if (!llamafile_has_metal())
-        return 0;
-    return ggml_metal.reg_init(params, user_data);
-}
-
-void ggml_backend_metal_get_device_properties(ggml_backend_t backend, struct ggml_metal_device_properties *properties) {
-    if (!llamafile_has_metal())
-        return;
-    return ggml_metal.get_device_properties(backend, properties);
-}
-
-void ggml_backend_metal_get_device_memory_usage(ggml_backend_t backend, float *used, float *total) {
-    if (!llamafile_has_metal())
-        return;
-    return ggml_metal.get_device_memory_usage(backend, used, total);
-}
-
-bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family) {
-    if (!llamafile_has_metal())
-        return 0;
-    return ggml_metal.supports_family(backend, family);
+    // If dylib is already loaded, apply immediately
+    if (g_metal.lib_handle && g_metal.log_set) {
+        g_metal.log_set(log_callback, user_data);
+    }
 }

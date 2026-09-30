@@ -32,7 +32,7 @@ void llamafile_check_cpu(void) {
 }
 
 static int on_missing_feature(const char *name) {
-    tinyprint(2, program_invocation_name, ": fatal error: the cpu feature ", name,
+    tinyprint(2, GetProgramExecutableName(), ": fatal error: the cpu feature ", name,
               " was required at build time but isn't available on this system\n", NULL);
 #if defined(__AVX2__) && !defined(__AVX512F__)
     tinyprint(2,

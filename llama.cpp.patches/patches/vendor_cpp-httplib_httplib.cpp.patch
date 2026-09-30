@@ -1,0 +1,66 @@
+diff --git a/vendor/cpp-httplib/httplib.cpp b/vendor/cpp-httplib/httplib.cpp
+--- a/llama.cpp/vendor/cpp-httplib/httplib.cpp
++++ b/llama.cpp/vendor/cpp-httplib/httplib.cpp
+@@ -7244,6 +7244,22 @@ void ThreadPool::cleanup_finished_threads() {
+ }
+ 
+ void ThreadPool::worker(bool is_dynamic) {
++#ifndef _WIN32
++  // Block every signal on this thread so pthread_cond_timedwait() can't
++  // be interrupted with EINTR (libcxx rethrows EINTR as std::system_error
++  // and std::terminates the process). Keep synchronous fault signals
++  // deliverable so real crashes still surface.
++  sigset_t block_mask;
++  sigfillset(&block_mask);
++  sigdelset(&block_mask, SIGSEGV);
++  sigdelset(&block_mask, SIGBUS);
++  sigdelset(&block_mask, SIGILL);
++  sigdelset(&block_mask, SIGFPE);
++  sigdelset(&block_mask, SIGABRT);
++  sigdelset(&block_mask, SIGSYS);
++  sigdelset(&block_mask, SIGTRAP);
++  pthread_sigmask(SIG_BLOCK, &block_mask, nullptr);
++#endif
+   for (;;) {
+     std::function<void()> fn;
+     {
+@@ -7261,7 +7277,13 @@ void ThreadPool::worker(bool is_dynamic) {
+           break;
+         }
+       } else {
+-        cond_.wait(lock, [&] { return !jobs_.empty() || shutdown_; });
++        // Use wait_for() instead of wait() to work around a
++        // Cosmopolitan libc bug where untimed futex waits on XNU
++        // (macOS) expire after ~72 minutes, causing
++        // condition_variable::wait() to throw ETIMEDOUT.
++        while (jobs_.empty() && !shutdown_) {
++          cond_.wait_for(lock, std::chrono::seconds(30));
++        }
+       }
+ 
+       idle_thread_count_--;
+@@ -14003,6 +14025,13 @@ bool enumerate_macos_keychain_certs(Callback cb) {
+ 
+ #if !defined(_WIN32) && !(defined(__APPLE__) &&                                \
+                           defined(CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN))
++#ifdef __COSMOPOLITAN__
++// Reference the Mozilla CA roots zipped into the APE (see llamafile's
++// third_party/mbedtls/sslroot) so the linker keeps them; they serve as
++// the trust-store fallback below on hosts without a system CA store
++// (notably Windows, where the _WIN32 branches above are not compiled).
++__static_yoink("ssl_root_support");
++#endif
+ // Common CA certificate file paths on Linux/Unix
+ const char **system_ca_paths() {
+   static const char *paths[] = {
+@@ -14020,6 +14049,10 @@ const char **system_ca_dirs() {
+   static const char *dirs[] = {"/etc/ssl/certs",             // Debian/Ubuntu
+                                "/etc/pki/tls/certs",         // RHEL/CentOS
+                                "/usr/share/ca-certificates", // Other
++#ifdef __COSMOPOLITAN__
++                               // CA bundle zipped into the APE (llamafile)
++                               "/zip/third_party/mbedtls/sslroot",
++#endif
+                                nullptr};
+   return dirs;
+ }

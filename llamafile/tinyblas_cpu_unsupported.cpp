@@ -17,6 +17,8 @@
 
 #include "sgemm.h"
 
+// Returns false to indicate sgemm is not supported.
+// When this happens, llama.cpp falls back to its generic matmul implementation.
 bool llamafile_sgemm_unsupported(long m, long n, long k, const void *A, long lda, const void *B,
                                  long ldb, void *C, long ldc, int ith, int nth, int Atype,
                                  int Btype, int Ctype) {
@@ -34,3 +36,6 @@ bool iqk_mul_mat_moe_unsupported(long, long, long, int, int, const void *, const
                                  long, long, const void *, int, int) {
     return false;
 }
+
+// Note: iqk_mul_mat, iqk_mul_mat_zen4, iqk_mul_mat_arm82 and their MoE variants
+// are provided by the IQK kernel files (iqk_mul_mat_amd_avx2.cpp, etc.)
